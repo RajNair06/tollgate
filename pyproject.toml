@@ -1,7 +1,7 @@
 [project]
 name = "toll-gate"
 version = "0.1.0"
-description = "Add your description here"
+description = "A policy gateway between AI agents and PayPal, so agents never touch money directly"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

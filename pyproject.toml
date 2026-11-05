@@ -5,9 +5,13 @@ description = "A policy gateway between AI agents and PayPal, so agents never to
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "alembic>=1.20.1",
     "fastapi>=0.162.0",
     "httpx>=0.28.1",
+    "psycopg[binary]>=3.3.8",
     "python-dotenv>=1.2.4",
+    "redis>=8.1.0",
+    "sqlalchemy>=2.0",
     "uvicorn>=0.54.0",
 ]
 

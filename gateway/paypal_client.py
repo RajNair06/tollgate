@@ -16,7 +16,7 @@ import logging
 import time
 import uuid
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 
@@ -28,6 +28,31 @@ DEFAULT_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=5.0)
 # Refresh the token this many seconds before it actually expires, so a token
 # cannot die mid-flight during a request.
 TOKEN_EXPIRY_MARGIN_SECONDS = 60.0
+
+
+class TokenCache(Protocol):
+    """Storage for the OAuth access token. Implementations: in-memory
+    (default, per-process) and Redis (shared across workers)."""
+
+    def get(self) -> str | None: ...
+    def set(self, token: str, expires_in: float) -> None: ...
+
+
+class InMemoryTokenCache:
+    """Default cache: two fields, monotonic clock, expiry margin applied."""
+
+    def __init__(self):
+        self._token: str | None = None
+        self._expires_at: float = 0.0
+
+    def get(self) -> str | None:
+        if self._token and time.monotonic() < self._expires_at:
+            return self._token
+        return None
+
+    def set(self, token: str, expires_in: float) -> None:
+        self._token = token
+        self._expires_at = time.monotonic() + expires_in - TOKEN_EXPIRY_MARGIN_SECONDS
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +148,7 @@ class PayPalClient:
         base_url: str,
         timeout: httpx.Timeout = DEFAULT_TIMEOUT,
         transport: httpx.BaseTransport | None = None,
+        token_cache: TokenCache | None = None,
     ):
         self._client_id = client_id
         self._client_secret = client_secret
@@ -132,9 +158,9 @@ class PayPalClient:
             headers={"Accept": "application/json"},
             transport=transport,  # test seam: httpx.MockTransport in tests
         )
-        # Token cache. Uses the monotonic clock: immune to wall-clock changes.
-        self._access_token: str | None = None
-        self._token_expires_at: float = 0.0
+        # Token cache: in-memory by default; the server injects RedisTokenCache
+        # so all worker processes share one token (one OAuth call per ~9h).
+        self._cache: TokenCache = token_cache or InMemoryTokenCache()
 
     def close(self) -> None:
         self._http.close()
@@ -145,15 +171,17 @@ class PayPalClient:
         """Return a valid access token, fetching a new one only when needed.
 
         Caching rules:
-        - Reuse the cached token while now < expires_at (expiry already
-          includes a 60-second safety margin).
+        - Reuse the cached token while the cache says it is valid (both cache
+          implementations retire it 60s before real expiry).
         - Otherwise POST /v1/oauth2/token with client credentials (Basic auth,
           grant_type=client_credentials) and cache the fresh token.
+        - force_refresh=True skips the cache read (used after a 401).
         """
-        now = time.monotonic()
-        if not force_refresh and self._access_token and now < self._token_expires_at:
-            logger.debug("Reusing cached access token (%.0fs left)", self._token_expires_at - now)
-            return self._access_token
+        if not force_refresh:
+            cached = self._cache.get()
+            if cached is not None:
+                logger.debug("Reusing cached access token")
+                return cached
 
         logger.info("Requesting new PayPal access token")
         try:
@@ -176,10 +204,10 @@ class PayPalClient:
             raise PayPalAuthError(response.status_code, name, message, debug_id=None)
 
         data = response.json()
-        self._access_token = data["access_token"]
-        self._token_expires_at = now + float(data["expires_in"]) - TOKEN_EXPIRY_MARGIN_SECONDS
+        token = data["access_token"]
+        self._cache.set(token, float(data["expires_in"]))
         logger.info("Access token acquired, valid for %ss", data["expires_in"])
-        return self._access_token
+        return token
 
     # -- Core request plumbing ----------------------------------------------
 

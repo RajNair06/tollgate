@@ -7,7 +7,10 @@ import uvicorn
 from fastapi import FastAPI, Request
 
 from config import get_settings
+from gateway.db import get_engine
 from gateway.paypal_client import PayPalClient
+from gateway.redis_client import RedisTokenCache
+from gateway.routes import router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -17,22 +20,29 @@ logging.basicConfig(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Build one PayPalClient at startup and close it at shutdown."""
+    """Build shared resources once: PayPal client (Redis-backed token cache),
+    DB engine. Close/dispose at shutdown."""
     settings = get_settings()
     client = PayPalClient(
         client_id=settings.paypal_client_id,
         client_secret=settings.paypal_client_secret,
         base_url=settings.paypal_base_url,
+        # Token cached in Redis: shared across workers, TTL-enforced.
+        # If Redis is down the cache fails open (fetches per call, logs).
+        token_cache=RedisTokenCache(),
     )
+    get_engine()  # fail fast if the database is unreachable at boot
     app.state.settings = settings
     app.state.paypal = client
     try:
         yield
     finally:
         client.close()
+        get_engine().dispose()
 
 
-app = FastAPI(title="Toll Gate Gateway", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Toll Gate Gateway", version="0.2.0", lifespan=lifespan)
+app.include_router(router)
 
 
 @app.get("/health")

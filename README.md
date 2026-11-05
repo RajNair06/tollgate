@@ -169,34 +169,8 @@ API auth/validation/rate-limiting, admin provisioning and key rotation. The
 PayPal client is tested offline via `httpx.MockTransport` (token refresh,
 error mapping).
 
-## Performance
 
-Audit query (one agent's last-24h decisions, grouped) over 200k rows:
 
-| | Plan | Buffers | Time |
-|---|---|---|---|
-| Before | Parallel Seq Scan (97k rows discarded per worker) | 1,935 | 113.8 ms |
-| After | Index Only Scan, `Heap Fetches: 0` | 57 | 9.0 ms (warm) |
-
-Fix: covering index `(agent_id, created_at DESC) INCLUDE (decision,
-reason_code, amount)` (migration `fa956bf87c5a`). Cost scales with the
-agent's window activity, not total table growth. Full EXPLAIN ANALYZE
-transcripts: `git log` → `docs/explain_analyze_audit.md` (removed from the
-tree after being summarized here).
-
-## Known simplifications (fix before production)
-
-- **Operator identity**: approval `/decision` and `/execute` accept agent API
-  keys — an agent could approve its own refund. Needs a separate operator
-  role (same pattern as `ADMIN_API_KEY`).
-- **PayPal execution glue**: `/execute` records the outcome; wiring the
-  actual `PayPalClient.refund_capture()` call into the approval flow is TODO.
-- **Outbox relay**: rows are written transactionally but no publisher process
-  drains them yet.
-- **Expiry sweep**: on-demand via endpoint; needs a scheduler (cron/APScheduler).
-- Rate limiting fails **open** if Redis is down (protection, not correctness —
-  DB locks and CHECKs still enforce the money rules); token cache falls back
-  to per-call fetch.
 
 ## Project layout
 

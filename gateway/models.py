@@ -256,8 +256,8 @@ class AuditLog(Base):
             "amount IS NULL OR amount > 0", name="ck_audit_amount_positive_or_null"
         ),
         # Perf index (migration 0002, added AFTER recording the seq-scan
-        # baseline — see docs/explain_analyze_audit.md). Composite
-        # (agent_id, created_at DESC) answers "one agent's recent history"
+        # baseline — before/after plans summarized in README §Performance).
+        # Composite (agent_id, created_at DESC) answers "one agent's recent history"
         # directly; INCLUDE columns make the typical aggregate query
         # index-only (no heap fetches at all).
         Index(

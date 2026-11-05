@@ -79,7 +79,7 @@ def make_agent():
     """
     from gateway.api_keys import generate_api_key
     from gateway.db import session_scope
-    from gateway.models import Agent, Policy
+    from gateway.models import Agent, AgentKey, Policy
 
     def _make(
         *,
@@ -92,12 +92,7 @@ def make_agent():
     ) -> tuple[int, str]:
         plaintext, key_hash, prefix = generate_api_key()
         with session_scope() as s:  # commits on exit → visible to other sessions
-            agent = Agent(
-                name=f"agent-{uuid4().hex[:10]}",
-                api_key_hash=key_hash,
-                api_key_prefix=prefix,
-                is_active=active,
-            )
+            agent = Agent(name=f"agent-{uuid4().hex[:10]}", is_active=active)
             s.add(agent)
             s.flush()
             s.add(
@@ -108,6 +103,12 @@ def make_agent():
                     rolling_24h_cap=Decimal(rolling),
                     approval_threshold=Decimal(threshold),
                     approval_ttl_minutes=ttl_minutes,
+                )
+            )
+            s.add(
+                AgentKey(
+                    agent_id=agent.id, key_hash=key_hash,
+                    key_prefix=prefix, label="primary",
                 )
             )
             s.flush()

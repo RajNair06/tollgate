@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from gateway.api_keys import generate_api_key  # noqa: E402
 from gateway.db import session_scope  # noqa: E402
-from gateway.models import Agent, Policy  # noqa: E402
+from gateway.models import Agent, AgentKey, Policy  # noqa: E402
 
 
 def main() -> None:
@@ -34,7 +34,7 @@ def main() -> None:
     plaintext, key_hash, prefix = generate_api_key()
 
     with session_scope() as session:
-        agent = Agent(name=name, api_key_hash=key_hash, api_key_prefix=prefix)
+        agent = Agent(name=name)
         session.add(agent)
         session.flush()  # assign agent.id
         session.add(Policy(
@@ -44,6 +44,10 @@ def main() -> None:
             rolling_24h_cap=rolling,
             approval_threshold=threshold,
             approval_ttl_minutes=ttl,
+        ))
+        session.add(AgentKey(
+            agent_id=agent.id, key_hash=key_hash, key_prefix=prefix,
+            label="primary",
         ))
         agent_id = agent.id
 

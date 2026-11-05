@@ -70,6 +70,9 @@ def agent_actions(
             reference_id=body.reference_id,
         ),
     )
+    # Commit before you speak: the client may immediately GET this action or
+    # replay the idempotency key; teardown-commit could lose that race.
+    session.commit()
     return DecisionResponse(
         outcome=decision.outcome,
         reason_code=decision.reason_code,
@@ -141,6 +144,7 @@ def decide_approval(approval_id: int, body: ApprovalDecisionRequest,
         approval = approvals_mod.decide(session, approval_id, body.decision, body.decided_by)
     except approvals_mod.InvalidTransitionError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    session.commit()  # commit before you speak
     return _approval_view(approval)
 
 
@@ -157,6 +161,7 @@ def execute_approval(approval_id: int, body: ExecutionResultRequest,
         )
     except approvals_mod.InvalidTransitionError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    session.commit()  # commit before you speak
     return _approval_view(approval)
 
 
@@ -166,4 +171,5 @@ def expire_approvals(ctx: AuthContext = Depends(enforce_rate_limit),
     """Run the expiry sweep now (pending approvals past expires_at → expired).
     Expiring releases each action's rolling-cap reservation."""
     expired = approvals_mod.expire_stale_approvals(session)
+    session.commit()  # commit before you speak
     return {"expired_count": len(expired), "approval_ids": expired}

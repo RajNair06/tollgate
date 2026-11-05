@@ -2,9 +2,11 @@
 
 Auth flow (per request):
   1. Extract key: X-API-Key header, or Authorization: Bearer tg_...
-  2. SHA-256 the key → single indexed lookup on agents.api_key_hash.
+  2. SHA-256 the key → single indexed lookup on agent_keys.key_hash.
      The plaintext key never touches the database or the logs.
-  3. Resolve agent + policy (1:1). Inactive agent or missing policy → reject.
+  3. Reject revoked keys; resolve the owning agent + policy (1:1).
+     Because this is a fresh DB read per request, keys issued or revoked
+     through the admin API take effect immediately — no restart, no cache.
   4. Every rejection is AUDITED (committed immediately — the request's
      transaction will roll back, but the audit trail of failures must not).
   5. Rate limits (Redis, shared across workers): per-agent window, then
@@ -27,7 +29,7 @@ from sqlalchemy.orm import Session
 from gateway import audit
 from gateway.api_keys import hash_api_key
 from gateway.db import session_scope
-from gateway.models import Agent, Policy
+from gateway.models import Agent, AgentKey, Policy
 from gateway.redis_client import RateLimitExceeded, check_rate_limits
 
 logger = logging.getLogger(__name__)
@@ -40,8 +42,14 @@ class AuthContext:
 
 
 def get_db() -> Iterator[Session]:
-    """One session per request, one transaction: commit when the handler
-    returns cleanly, rollback on any exception (including HTTPException)."""
+    """One session per request, one transaction.
+
+    Teardown commits on clean return / rolls back on exception — but that
+    commit can land AFTER the response reaches the client. Therefore every
+    MUTATING handler also commits explicitly before returning ("commit
+    before you speak"), so a client acting instantly on a response can
+    never outrun the commit. Teardown then commits an empty transaction.
+    """
     with session_scope() as session:
         yield session
 
@@ -82,15 +90,24 @@ def get_auth_context(
         raise _audit_and_reject(session, 401, "MISSING_API_KEY",
                                 {"hint": "send X-API-Key or Authorization: Bearer"})
 
-    agent = session.execute(
-        select(Agent).where(Agent.api_key_hash == hash_api_key(key))
+    key_row = session.execute(
+        select(AgentKey).where(AgentKey.key_hash == hash_api_key(key))
     ).scalar_one_or_none()
 
-    if agent is None:
+    if key_row is None:
         # Do not echo the key or its hash in the audit row — hashes of
         # low-entropy guesses are still guessable. Prefix is enough.
         raise _audit_and_reject(session, 401, "INVALID_API_KEY",
                                 {"key_prefix": key[:11]})
+    if key_row.revoked_at is not None:
+        # Soft-revoked: the presenter already knows this key existed, so
+        # naming the reason leaks nothing and helps honest operators debug
+        # a rotation that went wrong.
+        raise _audit_and_reject(session, 401, "API_KEY_REVOKED",
+                                {"key_prefix": key[:11], "key_id": key_row.id},
+                                agent_id=key_row.agent_id)
+
+    agent = session.get(Agent, key_row.agent_id)
     if not agent.is_active:
         raise _audit_and_reject(session, 403, "AGENT_INACTIVE",
                                 {"agent_id": agent.id}, agent_id=agent.id)

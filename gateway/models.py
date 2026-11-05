@@ -50,7 +50,14 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 # and by application code (policy_engine, approvals).
 ACTION_OUTCOMES = ("allowed", "denied", "pending_approval", "deduplicated")
 APPROVAL_STATUSES = ("pending", "approved", "rejected", "expired", "executed", "failed")
-AUDIT_DECISIONS = APPROVAL_STATUSES + ACTION_OUTCOMES + ("auth_failed", "rate_limited")
+AUDIT_DECISIONS = APPROVAL_STATUSES + ACTION_OUTCOMES + (
+    "auth_failed",
+    "rate_limited",
+    # Admin provisioning operations (migration 0003 widened the CHECK for these).
+    "agent_created",
+    "key_issued",
+    "key_revoked",
+)
 
 # Legal approval status transitions (application-enforced in approvals.py).
 APPROVAL_TRANSITIONS: dict[str, tuple[str, ...]] = {
@@ -72,10 +79,6 @@ class Agent(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
     name: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
-    # SHA-256 hex digest (64 chars) of the API key. The key itself is NEVER stored.
-    api_key_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
-    # First 8 chars of the key — not secret, lets ops identify a key in logs.
-    api_key_prefix: Mapped[str] = mapped_column(String(16), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -83,6 +86,46 @@ class Agent(Base):
 
     policy: Mapped["Policy"] = relationship(back_populates="agent", uselist=False)
     actions: Mapped[list["Action"]] = relationship(back_populates="agent")
+    keys: Mapped[list["AgentKey"]] = relationship(back_populates="agent")
+
+
+class AgentKey(Base):
+    """One API key for one agent. 1:N so keys can ROTATE without downtime:
+    issue a new key, let the agent migrate to it, then revoke the old one.
+
+    Only the SHA-256 hash is stored (64 hex chars). The plaintext key exists
+    exactly once — in the provisioning response — and can never be retrieved
+    again, by anyone, including admins.
+
+    Revocation is soft (revoked_at timestamp): the row stays for forensics,
+    and auth rejects it from the next request onward. No process restart,
+    no cache invalidation — the database is the only source of truth.
+    """
+
+    __tablename__ = "agent_keys"
+    __table_args__ = (
+        CheckConstraint(
+            "revoked_at IS NULL OR revoked_at >= created_at",
+            name="ck_agent_keys_revoked_after_created",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    agent_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("agents.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    key_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    # First 11 chars ("tg_" + 8) — not secret; lets ops identify a key in logs.
+    key_prefix: Mapped[str] = mapped_column(String(16), nullable=False)
+    # Optional human label, e.g. "primary" or "rotation-2026-11".
+    label: Mapped[str | None] = mapped_column(Text, nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    agent: Mapped[Agent] = relationship(back_populates="keys")
 
 
 class Policy(Base):

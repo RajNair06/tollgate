@@ -13,10 +13,18 @@ Strictness rules (deliberate):
 
 from __future__ import annotations
 
+import re
 from decimal import Decimal, InvalidOperation
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 
 def _strict_decimal(v: Any) -> Decimal:
@@ -103,3 +111,86 @@ class ActionView(BaseModel):
     reason_code: str
     reference_id: str | None
     created_at: str
+
+
+# ---------------------------------------------------------------------------
+# Admin provisioning (POST /v1/admin/...) — guarded by X-Admin-Key
+# ---------------------------------------------------------------------------
+
+class CreateAgentRequest(BaseModel):
+    """Admin: provision an agent with its policy and first API key."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    name: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.-]+$")
+    allowed_actions: list[str] = Field(min_length=1, max_length=32)
+    per_txn_cap: StrictDecimal = Field(gt=0, max_digits=12, decimal_places=2)
+    rolling_24h_cap: StrictDecimal = Field(gt=0, max_digits=12, decimal_places=2)
+    approval_threshold: StrictDecimal = Field(gt=0, max_digits=12, decimal_places=2)
+    approval_ttl_minutes: int = Field(default=60, gt=0, le=43200)
+    key_label: str | None = Field(default="primary", max_length=64)
+
+    @field_validator("allowed_actions")
+    @classmethod
+    def _check_actions(cls, v: list[str]) -> list[str]:
+        for item in v:
+            if not re.fullmatch(r"[a-z][a-z0-9_]*", item):
+                raise ValueError(
+                    f"action {item!r} invalid: lowercase snake_case only, "
+                    "e.g. 'refund'"
+                )
+        if len(set(v)) != len(v):
+            raise ValueError("allowed_actions contains duplicates")
+        return v
+
+    @model_validator(mode="after")
+    def _threshold_within_cap(self) -> "CreateAgentRequest":
+        # Mirrors ck_policies_threshold_within_cap: reject at the edge with a
+        # clear 422 instead of an opaque DB IntegrityError.
+        if self.approval_threshold > self.per_txn_cap:
+            raise ValueError(
+                "approval_threshold must be <= per_txn_cap, otherwise the "
+                "approval path is unreachable (cap denies first)"
+            )
+        return self
+
+
+class CreateAgentResponse(BaseModel):
+    agent_id: int
+    name: str
+    key_id: int
+    key_prefix: str
+    # Shown exactly once. The system stores only the SHA-256 hash; no one —
+    # not even an admin — can ever retrieve this plaintext again.
+    api_key: str
+
+
+class IssueKeyResponse(BaseModel):
+    agent_id: int
+    key_id: int
+    key_prefix: str
+    api_key: str  # shown exactly once
+
+
+class RevokeKeyResponse(BaseModel):
+    key_id: int
+    agent_id: int
+    key_prefix: str
+    revoked_at: str
+    already_revoked: bool
+
+
+class AgentKeyView(BaseModel):
+    id: int
+    key_prefix: str
+    label: str | None
+    created_at: str
+    revoked_at: str | None
+
+
+class AgentAdminView(BaseModel):
+    id: int
+    name: str
+    is_active: bool
+    created_at: str
+    policy: dict
+    keys: list[AgentKeyView]

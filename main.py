@@ -7,6 +7,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 
 from config import get_settings
+from gateway.admin import admin_router
 from gateway.db import get_engine
 from gateway.paypal_client import PayPalClient
 from gateway.redis_client import RedisTokenCache
@@ -41,8 +42,9 @@ async def lifespan(app: FastAPI):
         get_engine().dispose()
 
 
-app = FastAPI(title="Toll Gate Gateway", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="Toll Gate Gateway", version="0.3.0", lifespan=lifespan)
 app.include_router(router)
+app.include_router(admin_router)
 
 
 @app.get("/health")

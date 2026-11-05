@@ -24,6 +24,11 @@ class Settings:
     redis_url: str
     rate_limit_per_agent_per_min: int
     rate_limit_global_per_min: int
+    # Bootstrap credential for the /v1/admin routes. Deliberately an env var,
+    # NOT an agent key: root trust must come from deployment config (you can't
+    # create the admin credential through the admin API — chicken and egg).
+    # Empty string = admin routes disabled (fail-safe default).
+    admin_api_key: str
 
 
 def get_settings() -> Settings:
@@ -53,4 +58,5 @@ def get_settings() -> Settings:
         rate_limit_global_per_min=int(
             os.environ.get("RATE_LIMIT_GLOBAL_PER_MIN", "600")
         ),
+        admin_api_key=os.environ.get("ADMIN_API_KEY", "").strip(),
     )

@@ -9,6 +9,8 @@ from fastapi import FastAPI, Request
 from config import get_settings
 from gateway.admin import admin_router
 from gateway.db import get_engine
+from gateway.mcp_server import init_paypal_client
+from gateway.mcp_server import mcp as mcp_server
 from gateway.paypal_client import PayPalClient
 from gateway.redis_client import RedisTokenCache
 from gateway.routes import router
@@ -35,14 +37,25 @@ async def lifespan(app: FastAPI):
     get_engine()  # fail fast if the database is unreachable at boot
     app.state.settings = settings
     app.state.paypal = client
+    # MCP tools call PayPal through this injected client (shared token cache).
+    init_paypal_client(client)
     try:
-        yield
+        # The mounted MCP sub-app's lifespan does NOT run automatically under
+        # FastAPI — enter it here so the streamable-HTTP session manager is
+        # live before the first request.
+        async with mcp_app.lifespan(app):
+            yield
     finally:
         client.close()
         get_engine().dispose()
 
 
-app = FastAPI(title="Toll Gate Gateway", version="0.3.0", lifespan=lifespan)
+# MCP endpoint: streamable HTTP at /mcp. json_response=True: POST replies
+# arrive as plain JSON (spec-legal) instead of SSE streams — friendlier for
+# curl and every client we target.
+mcp_app = mcp_server.http_app(path="/mcp", json_response=True)
+
+app = FastAPI(title="Toll Gate Gateway", version="0.4.0", lifespan=lifespan)
 app.include_router(router)
 app.include_router(admin_router)
 
@@ -56,6 +69,12 @@ def health(request: Request) -> dict:
         "paypal_mode": settings.paypal_mode,
         "version": app.version,
     }
+
+
+# Mounted LAST — Starlette matches routes in registration order, so /health
+# and /v1/* keep priority and everything under /mcp falls through to the MCP
+# sub-app. Must be the SAME instance the lifespan enters above.
+app.mount("/", mcp_app)
 
 
 def main():

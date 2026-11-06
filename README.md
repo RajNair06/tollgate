@@ -9,16 +9,18 @@ money directly.
 ## Architecture
 
 ```
-AI agent ──(X-API-Key)──▶ FastAPI
-                            │  auth: SHA-256 lookup in agent_keys (per request, no cache)
-                            │  rate limit: Redis fixed windows (per-agent + global)
-                            ▼
-                        policy engine ──▶ PostgreSQL (decisions, caps, audit, outbox)
-                            │
-                        approvals (human-in-the-loop) ──▶ PayPal refunds
+AI agent ──(X-API-Key)──▶ FastAPI ──/v1/agent-actions──┐
+                             │                          ▼
+   MCP client ══(Bearer tg_…)══ /mcp (streamable HTTP) ──▶ policy engine
+                             │  auth: SHA-256 lookup in agent_keys (per request, no cache)
+                             │  rate limit: Redis fixed windows (per-agent + global)
+                             ▼                          │
+                         PostgreSQL (decisions, caps, audit, outbox)
+                             │
+                         approvals (human-in-the-loop) ──▶ PayPal refunds
 ```
 
-Two subsystems, one repo:
+Three subsystems, one repo:
 
 - **Policy engine** (PostgreSQL + Redis): agent identity, per-agent policies,
   atomic spending caps, approval workflow, append-only audit log.
@@ -27,6 +29,10 @@ Two subsystems, one repo:
   captures + full/partial refunds, disputes, idempotency via
   `PayPal-Request-Id`, `Decimal` money as strings, typed error hierarchy with
   `debug_id` logging.
+- **MCP server** (`gateway/mcp_server.py`, FastMCP): the same gateway exposed
+  to AI agents as Model Context Protocol tools over streamable HTTP at
+  `/mcp` — money-moving tools run the full policy engine before touching
+  PayPal.
 
 ## Data model (8 tables, `gateway/models.py`)
 
@@ -89,6 +95,39 @@ fresh DB read per request, keys issued or revoked through these endpoints are
 live on the next request with no restart (verified with a 50-cycle
 create→use-immediately hammer). Mutating handlers **commit before returning**
 so a client acting instantly on a response can never outrun the commit.
+
+### MCP server (`/mcp`, streamable HTTP)
+
+Auth is the same agent API key, sent as `Authorization: Bearer tg_...` (or
+`X-API-Key`) on every HTTP request — MCP sessions carry no identity of their
+own, so identity is re-resolved (and re-audited on failure) per call.
+
+| Tool | Policy-gated | Purpose |
+|---|---|---|
+| `get_transaction` | identity only | Fetch a capture by its 17-char ID (status, amount, times) |
+| `list_disputes` | identity only | Page through the account's disputes |
+| `get_dispute` | identity only | One dispute in full (`PP-D-*` id) |
+| `issue_refund` | **full engine** | Refund a capture: allowlist → caps → threshold. `allowed` executes on PayPal immediately with a deterministic `PayPal-Request-Id` (uuid5 of the action id — retries can't double-refund); `pending_approval` creates an approval and moves nothing |
+| `create_order` | **full engine** | Create an order (intent=CAPTURE, no money moves); requires `create_order` in the agent's `allowed_actions` |
+
+Input schemas are strict: 17-char `[A-Z0-9]` transaction IDs, `PP-D-\d+`
+dispute IDs, amounts as positive decimal **strings** (max 2dp), a currency
+allowlist (`USD EUR GBP CAD AUD INR`), 8–64-char idempotency keys, and
+`additionalProperties: false`. Every result is an envelope
+`{"ok": true, "summary": "...", ...}`; denials and pendings are **results**
+(`ok: true`, mirroring the HTTP API's "200 for all outcomes"), while auth,
+validation, and PayPal failures raise tool errors prefixed with a
+`REASON_CODE`. Execution outcomes are audited (`executed` /
+`PAYPAL_REFUND_COMPLETED`, `failed` / `PAYPAL_REFUND_FAILED`) and emitted as
+`refund.executed` / `refund.failed` events + outbox rows.
+
+MCP client configuration (e.g. for any MCP-compatible agent harness):
+
+```json
+{"mcpServers": {"tollgate": {
+  "url": "http://localhost:8000/mcp",
+  "headers": {"Authorization": "Bearer tg_..."}}}}
+```
 
 ## Requirements
 
@@ -153,10 +192,32 @@ partial refund → idempotent replay; refuses to run outside sandbox):
 uv run python scripts/toll_flow.py
 ```
 
+Call a tool over MCP with raw HTTP (streamable HTTP is plain JSON-RPC;
+`initialize` returns an `mcp-session-id` header to reuse):
+
+```bash
+curl -si -X POST localhost:8000/mcp \
+  -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer tg_..." \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"curl","version":"1.0"}}}'
+# → 200, header mcp-session-id: 3ee57961..., body: serverInfo {"name":"tollgate"}
+
+curl -s -X POST localhost:8000/mcp \
+  -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer tg_..." -H "mcp-session-id: 3ee57961..." \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"issue_refund","arguments":{"capture_id":"05Y454980K6595141","amount":"1.50","currency":"USD","idempotency_key":"mcp-live-refund-001"}}}'
+# → {"result":{"content":[{"text":"{\"ok\":true,\"summary\":\"Refund 92F13256LW3371821 executed: 1.50 USD ...\"}"}],"isError":false}}
+```
+
+Verified live against the PayPal sandbox: a $22 refund went
+`pending_approval` (approval created, PayPal untouched) and a $1.50 refund
+executed end-to-end (real refund `92F13256LW3371821`, audit rows
+`allowed` → `executed`, events + outbox written).
+
 ## Tests
 
 ```bash
-uv run pytest        # 54 tests, ~1.5 min — requires the Docker containers running
+uv run pytest        # 74 tests, ~1.5 min — requires the Docker containers running
 ```
 
 Runs against a real PostgreSQL test database (`tollgate_test`, created and
@@ -167,7 +228,13 @@ behavior. Coverage: policy outcomes and caps, dedup, approval lifecycle and
 expiry, 50-thread concurrency (allowed path and pending-reservation path),
 API auth/validation/rate-limiting, admin provisioning and key rotation. The
 PayPal client is tested offline via `httpx.MockTransport` (token refresh,
-error mapping).
+error mapping). The MCP server is tested end-to-end against a real uvicorn
+thread server and a real MCP client over streamable HTTP: discovery,
+unauthorized calls (missing/invalid/revoked keys, audited), invalid
+parameters, denied/pending/deduplicated/allowed-executed refunds, cap
+reservation across tools, and PayPal-failure auditing — with a
+MockTransport PayPal injected through the same `init_paypal_client()` seam
+`main.py` uses.
 
 
 
@@ -176,7 +243,8 @@ error mapping).
 
 ```
 config.py               env-driven settings (PayPal, DB, Redis, rate limits, admin key)
-main.py                 FastAPI app, lifespan (PayPal client w/ Redis token cache)
+main.py                 FastAPI app, lifespan (PayPal client w/ Redis token cache,
+                        MCP session manager), MCP sub-app mounted at /mcp
 gateway/
   paypal_client.py      PayPal REST client (pluggable TokenCache)
   models.py             the 8 tables + vocabularies + transition map
@@ -190,11 +258,12 @@ gateway/
   schemas.py            strict Pydantic request/response models
   routes.py             agent-facing endpoints
   admin.py              admin provisioning endpoints
+  mcp_server.py         MCP tools (streamable HTTP), header auth, PayPal execution glue
 alembic/                migrations (schema → perf index → agent_keys)
 scripts/
   create_agent.py       CLI provisioning (prints key once)
   toll_flow.py          live PayPal sandbox end-to-end demo
-tests/                  54 tests (real Postgres + MockTransport)
+tests/                  74 tests (real Postgres + MockTransport + real MCP over HTTP)
 ```
 
 ## License

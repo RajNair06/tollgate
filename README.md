@@ -48,7 +48,7 @@ Four subsystems, one repo:
 | `agents`     | Who may call the gateway (`name` UNIQUE, `is_active` kill switch) |
 | `agent_keys` | API-key SHA-256 hashes, 1:N per agent → zero-downtime key rotation; soft revocation (`revoked_at`) keeps rows for forensics |
 | `policies`   | One per agent: `allowed_actions` allowlist, `per_txn_cap`, `rolling_24h_cap`, `approval_threshold`, approval TTL. CHECK: threshold ≤ per-txn cap |
-| `actions`    | Every authorization request + verdict (`allowed` / `denied` / `pending_approval` / `deduplicated`) with reason code. Partial unique index `(agent_id, idempotency_key) WHERE outcome <> 'deduplicated'` makes double-spending physically impossible |
+| `actions`    | Every authorization request + verdict (`allowed` / `denied` / `pending_approval` / `deduplicated`) with reason code. `execution_failed_at` marks an allowed action whose PayPal execution definitely failed (releases its rolling-cap reservation; the verdict itself is immutable). Partial unique index `(agent_id, idempotency_key) WHERE outcome <> 'deduplicated'` makes double-spending physically impossible |
 | `approvals`  | Human-in-the-loop state machine: `pending → approved → executed`, plus `rejected` / `expired` / `failed`; CHECKs enforce timeline consistency |
 | `audit_log`  | Append-only record of **every** decision, including auth failures (nullable `agent_id`). FK with no cascade: audit rows block agent deletion |
 | `events`     | Immutable domain-event log (JSONB payloads) |
@@ -65,9 +65,13 @@ agent row first, so concurrent requests from one agent serialize while
 different agents never block each other. The rolling 24h cap sums committed
 `allowed` actions plus `pending_approval` actions whose approval is still live
 — pending approvals *reserve* headroom; rejecting or expiring them releases
-it. Every decision writes action + audit + event + outbox rows in **one
-transaction**: all land or none do. Proven by test: 50 barrier-aligned threads
-× $10 against a $100 cap → exactly 10 approvals, total exactly $100.00.
+it. An `allowed` action whose PayPal execution **definitely** failed (4xx
+business rejection — provably not executed) is stamped with
+`execution_failed_at` and releases its reservation too; ambiguous failures
+(timeouts, 5xx — the money may have moved) keep it, conservatively. Every
+decision writes action + audit + event + outbox rows in **one transaction**:
+all land or none do. Proven by test: 50 barrier-aligned threads × $10 against
+a $100 cap → exactly 10 approvals, total exactly $100.00.
 
 ## API
 
@@ -127,7 +131,12 @@ allowlist (`USD EUR GBP CAD AUD INR`), 8–64-char idempotency keys, and
 validation, and PayPal failures raise tool errors prefixed with a
 `REASON_CODE`. Execution outcomes are audited (`executed` /
 `PAYPAL_REFUND_COMPLETED`, `failed` / `PAYPAL_REFUND_FAILED`) and emitted as
-`refund.executed` / `refund.failed` events + outbox rows.
+`refund.executed` / `refund.failed` events + outbox rows. When a refund's
+PayPal execution fails *definitely* (4xx), the action's rolling-cap
+reservation is released and the failure audit records
+`cap_reservation_released: true`; a same-key replay then reports
+`original_execution_failed: true` with a hint to retry under a NEW
+idempotency key (decisions replay — they never re-execute).
 
 MCP client configuration (e.g. for any MCP-compatible agent harness):
 
@@ -307,7 +316,7 @@ executed end-to-end (real refund `92F13256LW3371821`, audit rows
 ## Tests
 
 ```bash
-uv run pytest        # 119 tests, ~2 min — requires the Docker containers running
+uv run pytest        # 125 tests, ~2.5 min — requires the Docker containers running
 ```
 
 Runs against a real PostgreSQL test database (`tollgate_test`, created and
@@ -323,7 +332,8 @@ thread server and a real MCP client over streamable HTTP: discovery,
 unauthorized calls (missing/invalid/revoked keys, audited), invalid
 parameters, denied/pending/deduplicated/allowed-executed refunds,
 approved-refund execution (incl. replay idempotence, ownership, and
-PayPal-failure → `failed`), cap reservation across tools, and
+PayPal-failure → `failed`), cap reservation across tools, cap release on
+definite execution failures (ambiguous failures keep the reservation), and
 PayPal-failure auditing — with a MockTransport PayPal injected through the
 same `init_paypal_client()` seam `main.py` uses.
 
@@ -376,7 +386,7 @@ agent/
 scripts/
   create_agent.py       CLI provisioning (prints key once)
   toll_flow.py          live PayPal sandbox end-to-end demo
-tests/                  119 tests (real Postgres + MockTransport + real MCP over HTTP
+tests/                  125 tests (real Postgres + MockTransport + real MCP over HTTP
                         + scripted-LLM agent tests + cross-process resume proof)
 ```
 

@@ -55,7 +55,7 @@ async def lifespan(app: FastAPI):
 # curl and every client we target.
 mcp_app = mcp_server.http_app(path="/mcp", json_response=True)
 
-app = FastAPI(title="Toll Gate Gateway", version="0.5.0", lifespan=lifespan)
+app = FastAPI(title="Toll Gate Gateway", version="0.5.1", lifespan=lifespan)
 app.include_router(router)
 app.include_router(admin_router)
 

@@ -80,6 +80,7 @@ def agent_actions(
         approval_id=decision.approval_id,
         duplicate_of_action_id=decision.duplicate_of_action_id,
         original_outcome=decision.original_outcome,
+        original_execution_failed=decision.original_execution_failed,
         rolling_24h_used=decision.rolling_24h_used,
         rolling_24h_cap=decision.rolling_24h_cap,
     )

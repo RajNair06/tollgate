@@ -206,6 +206,15 @@ class Action(Base):
     duplicate_of_action_id: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("actions.id"), nullable=True
     )
+    # Set when an 'allowed' action's PayPal execution failed DEFINITELY (4xx —
+    # provably not executed). Releases the amount from the 24h rolling cap.
+    # The decision row itself is immutable: outcome stays 'allowed' because
+    # the decision WAS allowed; this column records what happened next.
+    # Ambiguous failures (timeout, 5xx) leave it NULL — the money may have
+    # moved, so the reservation is kept (conservative).
+    execution_failed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), index=True
     )

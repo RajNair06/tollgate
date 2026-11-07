@@ -80,6 +80,9 @@ class DecisionResponse(BaseModel):
     approval_id: int | None = None
     duplicate_of_action_id: int | None = None
     original_outcome: str | None = None
+    # Dedup only: the original was 'allowed' but its PayPal execution
+    # definitely failed — replay will not re-execute; use a NEW key to retry.
+    original_execution_failed: bool = False
     rolling_24h_used: Decimal
     rolling_24h_cap: Decimal
 

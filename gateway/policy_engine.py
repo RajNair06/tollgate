@@ -19,7 +19,11 @@ blow through the cap (lost-update race). Two mechanisms, belt and braces:
     backstop against duplicate live actions even in exotic races.
 
 What counts toward the rolling cap:
-  * outcome='allowed' actions (money committed), plus
+  * outcome='allowed' actions (money committed) whose PayPal execution has
+    not DEFINITELY failed. A definite failure (4xx business rejection —
+    provably not executed) stamps actions.execution_failed_at and RELEASES
+    the reservation; an ambiguous failure (timeout, 5xx — outcome unknown,
+    money may have moved) keeps it. Plus:
   * outcome='pending_approval' actions whose approval is still live
     (status pending/approved/executed). Rejected/expired/failed approvals
     RELEASE their reservation — the money never moved.
@@ -75,6 +79,9 @@ class Decision:
     approval_id: int | None = None
     duplicate_of_action_id: int | None = None
     original_outcome: str | None = None   # for deduplicated: the first decision
+    # For deduplicated: the original was 'allowed' but its PayPal execution
+    # definitely failed — the caller should retry with a NEW idempotency key.
+    original_execution_failed: bool = False
     rolling_24h_used: Decimal = Decimal("0")
     rolling_24h_cap: Decimal = Decimal("0")
 
@@ -93,7 +100,12 @@ def rolling_consumption(session: Session, agent_id: int) -> Decimal:
             Action.agent_id == agent_id,
             Action.created_at >= window_start,
             or_(
-                Action.outcome == "allowed",
+                # 'allowed' counts unless its PayPal execution definitely
+                # failed (execution_failed_at set → reservation released).
+                and_(
+                    Action.outcome == "allowed",
+                    Action.execution_failed_at.is_(None),
+                ),
                 and_(
                     Action.outcome == "pending_approval",
                     Approval.status.in_(_CAP_RESERVING_STATUSES),
@@ -158,7 +170,9 @@ def authorize(session: Session, agent: Agent, policy: Policy,
         audit.record(session, decision="deduplicated", reason_code=RC_DUPLICATE_REQUEST,
                      agent_id=agent.id, action_id=replay.id, amount=req.amount,
                      detail={"duplicate_of_action_id": existing.id,
-                             "original_outcome": existing.outcome})
+                             "original_outcome": existing.outcome,
+                             "original_execution_failed":
+                                 existing.execution_failed_at is not None})
         _emit(session, event_type="action.deduplicated", aggregate_type="action",
               aggregate_id=replay.id,
               payload={"duplicate_of_action_id": existing.id})
@@ -166,7 +180,8 @@ def authorize(session: Session, agent: Agent, policy: Policy,
                     agent.id, req.idempotency_key, existing.id)
         return Decision(outcome="deduplicated", reason_code=RC_DUPLICATE_REQUEST,
                         action_id=replay.id, duplicate_of_action_id=existing.id,
-                        original_outcome=existing.outcome)
+                        original_outcome=existing.outcome,
+                        original_execution_failed=existing.execution_failed_at is not None)
 
     # -- 2. Allowlist ----------------------------------------------------------
     if req.action_type not in (policy.allowed_actions or []):

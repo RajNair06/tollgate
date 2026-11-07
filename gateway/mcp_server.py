@@ -43,14 +43,14 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_http_headers
 from pydantic import Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from gateway import audit
 from gateway import approvals as approvals_mod
 from gateway.api_keys import hash_api_key
 from gateway.db import session_scope
-from gateway.models import Agent, AgentKey, Approval, Policy
+from gateway.models import Action, Agent, AgentKey, Approval, Policy
 from gateway.paypal_client import (
     PayPalAPIError,
     PayPalClient,
@@ -150,6 +150,40 @@ def _describe_paypal_error(exc: PayPalError) -> str:
         return (f"[{exc.status_code}] {exc.name}: {exc.message} "
                 f"(debug_id={exc.debug_id})")
     return str(exc)
+
+
+# 4xx codes that do NOT prove non-execution: 408 (server timed out mid-
+# request) and 425 (too early) leave the outcome unknown, like 5xx/timeouts.
+_AMBIGUOUS_4XX = (408, 425)
+
+
+def _is_definite_execution_failure(exc: PayPalError) -> bool:
+    """Did PayPal PROVABLY not execute the call?
+
+    Definite (True): a 4xx business rejection — PayPal refused the request
+    before executing it (invalid capture, already refunded, auth, rate
+    limit). Money did not move, so the rolling-cap reservation can be
+    released.
+
+    Ambiguous (False): timeouts and 5xx — the call may have been processed
+    and only the answer lost. The reservation is KEPT (conservative); the
+    deterministic PayPal-Request-Id makes a same-id retry safe regardless.
+    """
+    return (isinstance(exc, PayPalAPIError)
+            and 400 <= exc.status_code < 500
+            and exc.status_code not in _AMBIGUOUS_4XX)
+
+
+def _release_cap_reservation(session: Session, action_id: int,
+                             definite: bool) -> None:
+    """Stamp execution_failed_at on an 'allowed' action whose PayPal call
+    definitely failed, releasing its rolling-cap reservation. Ambiguous
+    failures are left untouched (the money may have moved)."""
+    if not definite:
+        return
+    action = session.get(Action, action_id)
+    if action is not None:
+        action.execution_failed_at = func.now()
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +287,7 @@ def _decision_payload(decision) -> dict:
         "approval_id": decision.approval_id,
         "duplicate_of_action_id": decision.duplicate_of_action_id,
         "original_outcome": decision.original_outcome,
+        "original_execution_failed": decision.original_execution_failed,
         "rolling_24h_used": str(decision.rolling_24h_used),
         "rolling_24h_cap": str(decision.rolling_24h_cap),
     }
@@ -274,7 +309,10 @@ def _not_allowed_envelope(decision, amount: Decimal, currency: str,
                              f"headroom until decided or expired."),
         "deduplicated": (f"Duplicate request — the original decision was "
                          f"'{decision.original_outcome}' "
-                         f"(action #{decision.duplicate_of_action_id})."),
+                         f"(action #{decision.duplicate_of_action_id})."
+                         + (" Its PayPal execution FAILED; replays will not "
+                            "re-execute it — retry with a NEW idempotency key."
+                            if decision.original_execution_failed else "")),
     }
     return {"ok": True, "summary": summaries[decision.outcome],
             "decision": _decision_payload(decision)}
@@ -413,12 +451,15 @@ def issue_refund(
                 capture_id, amount, currency,
                 note_to_payer=note_to_payer, request_id=request_id)
         except PayPalError as exc:
+            definite = _is_definite_execution_failure(exc)
+            _release_cap_reservation(session, decision.action_id, definite)
             audit.record(session, decision="failed",
                          reason_code="PAYPAL_REFUND_FAILED",
                          agent_id=agent.id, action_id=decision.action_id,
                          amount=amount,
                          detail={"capture_id": capture_id,
                                  "paypal_request_id": request_id,
+                                 "cap_reservation_released": definite,
                                  "error": _describe_paypal_error(exc)[:300]})
             _emit(session, event_type="refund.failed", aggregate_type="action",
                   aggregate_id=decision.action_id,
@@ -506,6 +547,9 @@ def execute_approved_refund(
                 action.reference_id, action.amount, action.currency,
                 request_id=request_id)
         except PayPalError as exc:
+            # No execution_failed_at stamp needed here: this action is
+            # 'pending_approval', and its reservation is released by the
+            # approval moving to 'failed' (not a cap-reserving status).
             approvals_mod.mark_execution(
                 session, approval.id, executed=False,
                 reason_code="PAYPAL_REFUND_FAILED",
@@ -577,11 +621,14 @@ def create_order(
                 custom_id=f"agent-{agent.id}-action-{decision.action_id}",
                 request_id=request_id)
         except PayPalError as exc:
+            definite = _is_definite_execution_failure(exc)
+            _release_cap_reservation(session, decision.action_id, definite)
             audit.record(session, decision="failed",
                          reason_code="PAYPAL_ORDER_FAILED",
                          agent_id=agent.id, action_id=decision.action_id,
                          amount=amount,
                          detail={"paypal_request_id": request_id,
+                                 "cap_reservation_released": definite,
                                  "error": _describe_paypal_error(exc)[:300]})
             _emit(session, event_type="order.failed", aggregate_type="action",
                   aggregate_id=decision.action_id,

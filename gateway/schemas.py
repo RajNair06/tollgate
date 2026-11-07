@@ -120,6 +120,19 @@ class ActionView(BaseModel):
 # Admin provisioning (POST /v1/admin/...) — guarded by X-Admin-Key
 # ---------------------------------------------------------------------------
 
+def _check_action_names(v: list[str]) -> list[str]:
+    """Shared allowed_actions vocabulary: lowercase snake_case, no duplicates."""
+    for item in v:
+        if not re.fullmatch(r"[a-z][a-z0-9_]*", item):
+            raise ValueError(
+                f"action {item!r} invalid: lowercase snake_case only, "
+                "e.g. 'refund'"
+            )
+    if len(set(v)) != len(v):
+        raise ValueError("allowed_actions contains duplicates")
+    return v
+
+
 class CreateAgentRequest(BaseModel):
     """Admin: provision an agent with its policy and first API key."""
     model_config = ConfigDict(extra="forbid", strict=True)
@@ -135,15 +148,7 @@ class CreateAgentRequest(BaseModel):
     @field_validator("allowed_actions")
     @classmethod
     def _check_actions(cls, v: list[str]) -> list[str]:
-        for item in v:
-            if not re.fullmatch(r"[a-z][a-z0-9_]*", item):
-                raise ValueError(
-                    f"action {item!r} invalid: lowercase snake_case only, "
-                    "e.g. 'refund'"
-                )
-        if len(set(v)) != len(v):
-            raise ValueError("allowed_actions contains duplicates")
-        return v
+        return _check_action_names(v)
 
     @model_validator(mode="after")
     def _threshold_within_cap(self) -> "CreateAgentRequest":
@@ -155,6 +160,39 @@ class CreateAgentRequest(BaseModel):
                 "approval path is unreachable (cap denies first)"
             )
         return self
+
+
+class UpdateAgentRequest(BaseModel):
+    """Admin: partial update of an agent — the kill switch (is_active) and/or
+    any policy field. Only fields present in the body are applied; at least
+    one change field is required (the endpoint rejects a no-op with 422
+    NOTHING_TO_UPDATE). Explicit nulls are rejected — PATCH removes nothing.
+
+    `actor` is the self-reported operator identity, recorded in the audit
+    detail. Same trust level as approvals' `decided_by` until operator keys
+    exist; the field is API-stable so that future operator authentication
+    replaces the trust model without changing the request shape.
+    """
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    actor: str = Field(min_length=1, max_length=128)
+    is_active: bool | None = None
+    allowed_actions: list[str] | None = Field(default=None, min_length=1,
+                                              max_length=32)
+    per_txn_cap: StrictDecimal | None = Field(default=None, gt=0,
+                                              max_digits=12, decimal_places=2)
+    rolling_24h_cap: StrictDecimal | None = Field(default=None, gt=0,
+                                                  max_digits=12,
+                                                  decimal_places=2)
+    approval_threshold: StrictDecimal | None = Field(default=None, gt=0,
+                                                     max_digits=12,
+                                                     decimal_places=2)
+    approval_ttl_minutes: int | None = Field(default=None, gt=0, le=43200)
+
+    @field_validator("allowed_actions")
+    @classmethod
+    def _check_actions(cls, v: list[str] | None) -> list[str] | None:
+        return None if v is None else _check_action_names(v)
 
 
 class CreateAgentResponse(BaseModel):

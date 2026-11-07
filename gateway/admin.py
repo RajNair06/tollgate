@@ -14,6 +14,7 @@ not accepted on /v1/admin/*.
 Key lifecycle
 -------------
 - POST /v1/admin/agents               agent + policy + first key
+- PATCH /v1/admin/agents/{id}         kill switch (is_active) + policy updates
 - POST /v1/admin/agents/{id}/keys     additional key (rotation: issue new,
                                       migrate the agent, then revoke old)
 - DELETE /v1/admin/keys/{key_id}      soft revoke (revoked_at set)
@@ -22,16 +23,18 @@ Key lifecycle
 The plaintext key appears exactly once, in the response that created it.
 Only the SHA-256 hash is stored; retrieval is impossible by design.
 
-Everything is audited (agent_created / key_issued / key_revoked) in the same
-transaction as the change, and — because auth does a fresh indexed lookup
-per request — new keys work and revoked keys die on the RUNNING server with
-no restart and no cache invalidation.
+Everything is audited (agent_created / agent_updated / key_issued /
+key_revoked) in the same transaction as the change, and — because auth does
+a fresh indexed lookup per request — new keys work, revoked keys die, and
+deactivated agents are locked out on the RUNNING server with no restart and
+no cache invalidation.
 """
 
 from __future__ import annotations
 
 import hmac
 import logging
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy import func, select
@@ -50,6 +53,7 @@ from gateway.schemas import (
     CreateAgentResponse,
     IssueKeyResponse,
     RevokeKeyResponse,
+    UpdateAgentRequest,
 )
 
 logger = logging.getLogger(__name__)
@@ -153,6 +157,90 @@ def create_agent(
     return CreateAgentResponse(agent_id=agent.id, name=agent.name,
                                key_id=key.id, key_prefix=prefix,
                                api_key=plaintext)
+
+
+@admin_router.patch("/agents/{agent_id}", response_model=AgentAdminView)
+def update_agent(
+    agent_id: int,
+    body: UpdateAgentRequest,
+    _: None = Depends(require_admin),
+    session: Session = Depends(get_db),
+):
+    """Partial update of an agent: the kill switch (is_active) and/or policy.
+
+    Takes effect on the RUNNING server immediately — auth reads the DB per
+    request, nothing caches. Deactivating blocks every authenticated surface
+    (HTTP authorize, all MCP tools, approval execution) but does NOT
+    auto-cancel pending approvals: the agent simply cannot execute them, and
+    the expire-approvals sweep remains the operator's tool for releasing
+    those reservations early.
+
+    Audited as agent_updated with a before/after diff of the changed fields
+    and the self-reported actor, in the same transaction as the change.
+    """
+    changes = body.model_dump(exclude_unset=True)
+    changes.pop("actor", None)
+    if not changes:
+        raise HTTPException(status_code=422,
+                            detail={"reason_code": "NOTHING_TO_UPDATE"})
+    for field, value in changes.items():
+        if value is None:  # explicit null: PATCH updates, it never removes
+            raise HTTPException(status_code=422,
+                                detail={"reason_code": "NULL_NOT_ALLOWED",
+                                        "field": field})
+
+    # Same lock authorize() takes: an admin mutation serializes against
+    # in-flight decisions for this agent (no lost updates either way).
+    agent = session.execute(
+        select(Agent).where(Agent.id == agent_id).with_for_update()
+    ).scalar_one_or_none()
+    if agent is None:
+        raise HTTPException(status_code=404,
+                            detail={"reason_code": "AGENT_NOT_FOUND"})
+    policy = agent.policy
+
+    def _auditable(v):
+        return str(v) if isinstance(v, Decimal) else v
+
+    diff: dict = {}
+
+    def _apply(obj, field: str, new_value) -> None:
+        old = getattr(obj, field)
+        if old != new_value:
+            diff[field] = {"before": _auditable(old),
+                           "after": _auditable(new_value)}
+        setattr(obj, field, new_value)
+
+    for field, value in changes.items():
+        _apply(agent if field == "is_active" else policy, field, value)
+
+    # Effective (post-merge) invariant — mirrors ck_policies_threshold_within_cap.
+    # Checked BEFORE flush so a cap shrink can't sneak past via the other field.
+    if policy.approval_threshold > policy.per_txn_cap:
+        session.rollback()
+        raise HTTPException(
+            status_code=422,
+            detail={"reason_code": "POLICY_INVARIANT_VIOLATED",
+                    "message": "approval_threshold must be <= per_txn_cap"})
+    try:
+        session.flush()
+    except IntegrityError as exc:  # DB CHECKs/NOT NULL as the hard backstop
+        session.rollback()
+        raise HTTPException(status_code=422,
+                            detail={"reason_code": "POLICY_INVARIANT_VIOLATED",
+                                    "message": str(exc.orig)[:200]}) from exc
+
+    audit.record(session, decision="agent_updated", reason_code="OK",
+                 agent_id=agent.id,
+                 detail={"actor": body.actor, "changes": diff})
+    # Commit before you speak — see create_agent. Security-critical direction:
+    # a "deactivated" response must never arrive while the agent still works.
+    session.commit()
+    logger.info("Admin updated agent %s (actor=%s): %s",
+                agent.name, body.actor, ", ".join(sorted(diff)) or "no-op")
+
+    _ = agent.policy, agent.keys  # lazy loads while the session is open
+    return _agent_view(agent)
 
 
 @admin_router.post("/agents/{agent_id}/keys", response_model=IssueKeyResponse)

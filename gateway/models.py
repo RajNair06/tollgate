@@ -57,6 +57,7 @@ AUDIT_DECISIONS = APPROVAL_STATUSES + ACTION_OUTCOMES + (
     "agent_created",
     "key_issued",
     "key_revoked",
+    "agent_updated",
 )
 
 # Legal approval status transitions (application-enforced in approvals.py).

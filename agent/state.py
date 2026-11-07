@@ -20,7 +20,7 @@ from __future__ import annotations
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal, TypedDict
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, model_validator
 
 # Same vocabularies as the gateway's MCP layer — one wire language end to end.
 CURRENCIES = ("USD", "EUR", "GBP", "CAD", "AUD", "INR")
@@ -29,6 +29,11 @@ DISPUTE_ID_PATTERN = r"^PP-D-\d{1,12}$"
 TIMESTAMP_PATTERN = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$"
 
 # Below this confidence the schema refuses any automatic action.
+# This is a POLICY DEFAULT, not a measured value: LLM self-reported
+# confidence is uncalibrated until agent_runs accumulates labeled outcomes
+# (every human approval/escalation decision is a label). Override per
+# deployment via AGENT_MIN_CONFIDENCE (agent/config.py) → build_graph(
+# min_confidence=...) → validation context below.
 MIN_CONFIDENCE_FOR_ACTION = 0.6
 
 
@@ -85,7 +90,7 @@ class RefundDecision(BaseModel):
     cited_evidence: list[CitedEvidence] = Field(min_length=1, max_length=20)
 
     @model_validator(mode="after")
-    def _cross_field_rules(self) -> "RefundDecision":
+    def _cross_field_rules(self, info: ValidationInfo) -> "RefundDecision":
         try:
             amount = Decimal(self.refund_amount)
         except InvalidOperation as exc:  # pragma: no cover — pattern guards this
@@ -102,8 +107,10 @@ class RefundDecision(BaseModel):
                     f"{self.proposed_action} must carry refund_amount '0.00', "
                     f"got {self.refund_amount!r}")
 
-        if self.confidence < MIN_CONFIDENCE_FOR_ACTION and self.proposed_action != "escalate_human":
+        min_confidence = float((info.context or {}).get(
+            "min_confidence", MIN_CONFIDENCE_FOR_ACTION))
+        if self.confidence < min_confidence and self.proposed_action != "escalate_human":
             raise ValueError(
-                f"confidence {self.confidence} < {MIN_CONFIDENCE_FOR_ACTION} "
+                f"confidence {self.confidence} < {min_confidence} "
                 f"must escalate_human, not {self.proposed_action}")
         return self

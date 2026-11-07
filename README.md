@@ -179,8 +179,12 @@ Guards worth knowing:
 - **The decision is a schema, not prose.** `RefundDecision`
   (`extra="forbid"`) enforces the gateway's ID/timestamp regexes, refund > 0
   only with `issue_refund`, cited transaction IDs that exist in the
-  evidence, refund ≤ transaction amount, and confidence < 0.6 ⇒
-  `escalate_human`. Validation failure is a terminal `schema_failed` status.
+  evidence, refund ≤ transaction amount, and confidence below the floor ⇒
+  `escalate_human`. The floor defaults to 0.6 and is configurable via
+  `AGENT_MIN_CONFIDENCE` — a policy default, not a measured value: LLM
+  self-reported confidence stays uncalibrated until labeled outcomes
+  accumulate (every human approval/escalation is a label). Validation
+  failure is a terminal `schema_failed` status.
 - **Approval pauses the graph, durably.** `pending_approval` triggers a
   LangGraph `interrupt()`; the state is checkpointed in PostgreSQL
   (`langgraph-checkpoint-postgres`, its own `agent` database). The process
@@ -191,8 +195,10 @@ Guards worth knowing:
   token budget checked *before* every call, and USD cost from a static
   price table. Transient Gemini failures (429/5xx/network) retry with
   exponential backoff + jitter; 4xx do not.
-- Telemetry lands in `agent_runs` (status, in/out tokens, cost, LLM calls)
-  in the agent database.
+- Telemetry lands in `agent_runs` (status, in/out tokens, cost, LLM calls,
+  plus `confidence` and `proposed_action` — the calibration dataset that
+  will let the confidence floor become a measured number) in the agent
+  database.
 
 Running it:
 
@@ -316,7 +322,7 @@ executed end-to-end (real refund `92F13256LW3371821`, audit rows
 ## Tests
 
 ```bash
-uv run pytest        # 125 tests, ~2.5 min — requires the Docker containers running
+uv run pytest        # 127 tests, ~2.5 min — requires the Docker containers running
 ```
 
 Runs against a real PostgreSQL test database (`tollgate_test`, created and
@@ -386,7 +392,7 @@ agent/
 scripts/
   create_agent.py       CLI provisioning (prints key once)
   toll_flow.py          live PayPal sandbox end-to-end demo
-tests/                  125 tests (real Postgres + MockTransport + real MCP over HTTP
+tests/                  127 tests (real Postgres + MockTransport + real MCP over HTTP
                         + scripted-LLM agent tests + cross-process resume proof)
 ```
 

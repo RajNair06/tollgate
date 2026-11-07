@@ -343,6 +343,24 @@ def test_prompt_loader_reads_v1_and_fails_loudly():
     assert "v1" in available_versions()
 
 
+def test_min_confidence_env_parsing(monkeypatch):
+    from agent.config import get_agent_settings
+    from agent.state import MIN_CONFIDENCE_FOR_ACTION
+
+    monkeypatch.delenv("AGENT_MIN_CONFIDENCE", raising=False)
+    assert get_agent_settings().min_confidence == MIN_CONFIDENCE_FOR_ACTION
+
+    monkeypatch.setenv("AGENT_MIN_CONFIDENCE", "0.8")
+    assert get_agent_settings().min_confidence == 0.8
+
+    # Fail loudly at startup, never silently clamp: out-of-range or garbage
+    # values are configuration errors.
+    for bad in ("1.5", "-0.1", "high"):
+        monkeypatch.setenv("AGENT_MIN_CONFIDENCE", bad)
+        with pytest.raises(ValueError):
+            get_agent_settings()
+
+
 def test_meter_cost_math():
     meter = RunMeter(model="gemini-2.5-flash", budget_tokens=10**9)
     meter.charge(1_000_000, 1_000_000)   # 1M in + 1M out

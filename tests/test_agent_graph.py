@@ -54,13 +54,15 @@ def agent_db():
     conn.close()
 
 
-def make_graph(saver, llm_script, responses, *, meter=None, run_log=None):
+def make_graph(saver, llm_script, responses, *, meter=None, run_log=None,
+               min_confidence=None):
     llm = ScriptedLLM(llm_script, meter=meter)
     registry = FakeRegistry(responses)
     records = []
+    extra = {} if min_confidence is None else {"min_confidence": min_confidence}
     graph = build_graph(llm, registry, prompt_version="v1",
                         checkpointer=saver,
-                        run_log=run_log or records.append)
+                        run_log=run_log or records.append, **extra)
     return graph, llm, registry, records
 
 
@@ -356,6 +358,31 @@ def test_low_confidence_auto_action_fails_schema(agent_db):
     assert "escalate_human" in result["error"]
 
 
+def test_min_confidence_floor_is_configurable(agent_db):
+    # The 0.4 + issue_refund that fails under the default floor passes when
+    # the deployment lowers it...
+    graph, _, _, _ = make_graph(
+        agent_db,
+        [CLEAN_DRAFT, CRITIC_OK, decision_json(confidence=0.4)],
+        {**HAPPY_RESPONSES, "issue_refund": envelope_refund_executed()},
+        min_confidence=0.3)
+    state, config, _ = fresh_state()
+    result = graph.invoke(state, config)
+    assert result["status"] == "refund_executed"
+
+    # ...and a normally-fine 0.9 is caught by a stricter floor. The error
+    # quotes the EFFECTIVE threshold, so prompt and validator can't drift.
+    graph, _, _, _ = make_graph(
+        agent_db,
+        [CLEAN_DRAFT, CRITIC_OK, decision_json(confidence=0.9)],
+        HAPPY_RESPONSES,
+        min_confidence=0.95)
+    state, config, _ = fresh_state()
+    result = graph.invoke(state, config)
+    assert result["status"] == "schema_failed"
+    assert "0.95" in result["error"]
+
+
 def test_cited_transaction_must_exist_in_evidence(agent_db):
     # Valid-looking citation of a transaction that was never retrieved.
     decision = json.loads(decision_json())
@@ -416,11 +443,16 @@ def test_run_log_row_lands_in_postgres(agent_db):
 
     with psycopg.connect(AGENT_TEST_DB) as conn:
         row = conn.execute(
-            "SELECT status, input_tokens, output_tokens, cost_usd, llm_calls "
+            "SELECT status, input_tokens, output_tokens, cost_usd, llm_calls, "
+            "confidence, proposed_action "
             "FROM agent_runs WHERE run_id = %s", (run_id,)).fetchone()
     assert row is not None
-    status, in_tok, out_tok, cost, calls = row
+    status, in_tok, out_tok, cost, calls, confidence, proposed = row
     assert status == "refund_executed"
     assert in_tok == 300 and out_tok == 150 and calls == 3  # 3 LLM nodes
     assert float(cost) > 0
+    # Calibration columns: what the agent proposed and how sure it claimed
+    # to be — the raw material for tuning the floor once labels exist.
+    assert confidence == pytest.approx(0.9)
+    assert proposed == "issue_refund"
     run_log.dispose()

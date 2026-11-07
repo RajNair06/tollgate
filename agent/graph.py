@@ -49,7 +49,7 @@ from langgraph.types import interrupt
 from agent.budget import LLMBudgetExceeded, RunMeter
 from agent.gemini_client import LLMClient, LLMError
 from agent.prompts import load_prompt
-from agent.state import AgentState, RefundDecision
+from agent.state import MIN_CONFIDENCE_FOR_ACTION, AgentState, RefundDecision
 from agent.tools import ToolRegistry, ToolCallError, interpret_refund_result
 
 logger = logging.getLogger(__name__)
@@ -94,14 +94,23 @@ def build_graph(
     prompt_version: str = "v1",
     checkpointer: Any | None = None,
     run_log: Callable[[dict], None] | None = None,
+    min_confidence: float = MIN_CONFIDENCE_FOR_ACTION,
 ):
     """Compile the dispute-handling graph.
 
     run_log: called by finalize with the run-record dict (persisted by the
     caller — tests capture it in memory, production writes PostgreSQL).
+    min_confidence: confidence floor below which the decision schema forces
+    escalate_human. A policy knob (env AGENT_MIN_CONFIDENCE), not a measured
+    value — see agent/state.py.
     """
     prompts = {name: load_prompt(name, prompt_version)
                for name in ("draft_response", "critic", "decide_refund")}
+    # Tell the model the ACTUAL floor in force — the prompt and the schema
+    # validator must never disagree, or the model "passes" a decision the
+    # validator then rejects.
+    prompts["decide_refund"] = prompts["decide_refund"].replace(
+        "{{MIN_CONFIDENCE}}", str(min_confidence))
 
     # -- nodes -----------------------------------------------------------------
 
@@ -199,7 +208,8 @@ def build_graph(
 
         # Validate the decision schema — one pass, fail closed.
         try:
-            decision = RefundDecision.model_validate_json(_strip_code_fence(text))
+            decision = RefundDecision.model_validate_json(
+                _strip_code_fence(text), context={"min_confidence": min_confidence})
         except ValueError as exc:
             return {"decision": None, "decision_error": str(exc),
                     **_fail("schema_failed", f"decision schema validation failed: {exc}")}
@@ -308,12 +318,20 @@ def build_graph(
             summary = state.get("error") or state.get("summary") or status
 
         usage = getattr(llm, "meter", None)
+        decision = state.get("decision")
         record = {
             "run_id": state["run_id"],
             "dispute_id": state["dispute_id"],
             "status": status,
             "summary": summary,
             "usage": usage.as_dict() if usage else {},
+            # Calibration dataset: what the agent proposed and how sure it
+            # was. Human approval/escalation outcomes (gateway side) are the
+            # labels; these columns make "confidence vs. correctness" a
+            # single query once enough runs exist.
+            "confidence": (decision or {}).get("confidence"),
+            "proposed_action": (decision or {}).get("proposed_action"),
+            "decision": decision,
         }
         if run_log is not None:
             try:

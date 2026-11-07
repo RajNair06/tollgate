@@ -88,7 +88,8 @@ def main(argv: list[str] | None = None) -> int:
                        backoff_cap=settings.backoff_max_seconds)
     registry = build_tollgate_registry(settings.mcp_url, settings.gateway_api_key)
     graph = build_graph(llm, registry, prompt_version=settings.prompt_version,
-                        checkpointer=saver, run_log=run_log.write)
+                        checkpointer=saver, run_log=run_log.write,
+                        min_confidence=settings.min_confidence)
 
     try:
         if args.resume:

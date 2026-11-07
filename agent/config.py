@@ -8,6 +8,19 @@ to the same policies, caps, and audit trail as any other agent.
 import os
 from dataclasses import dataclass
 
+from agent.state import MIN_CONFIDENCE_FOR_ACTION
+
+
+def _env_unit_interval(name: str, default: float) -> float:
+    """Parse a 0..1 float from the environment; unset/empty → default."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    value = float(raw)  # ValueError on garbage — fail loudly at startup
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be within [0, 1], got {value}")
+    return value
+
 
 @dataclass(frozen=True)
 class AgentSettings:
@@ -24,6 +37,10 @@ class AgentSettings:
     database_url: str
     # Prompt version directory under agent/prompts/.
     prompt_version: str
+    # Confidence floor (0..1) below which the decision schema refuses any
+    # automatic action and forces escalate_human. A policy default, not a
+    # measured value — tune it against labeled outcomes in agent_runs.
+    min_confidence: float
 
     # Transient-failure retry policy for LLM calls.
     max_retries: int = 5
@@ -43,4 +60,6 @@ def get_agent_settings() -> AgentSettings:
             "postgresql://tollgate:tollgate@localhost:5433/agent",
         ).strip(),
         prompt_version=os.environ.get("AGENT_PROMPT_VERSION", "v1").strip(),
+        min_confidence=_env_unit_interval(
+            "AGENT_MIN_CONFIDENCE", MIN_CONFIDENCE_FOR_ACTION),
     )

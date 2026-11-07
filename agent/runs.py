@@ -12,7 +12,7 @@ import json
 import logging
 from datetime import datetime, timezone
 
-from sqlalchemy import (JSON, BigInteger, Column, DateTime, MetaData,
+from sqlalchemy import (JSON, BigInteger, Column, DateTime, Float, MetaData,
                         Numeric, String, Table, create_engine, text)
 
 logger = logging.getLogger(__name__)
@@ -30,6 +30,12 @@ agent_runs = Table(
     Column("total_tokens", BigInteger, nullable=False, default=0),
     Column("cost_usd", Numeric(12, 6), nullable=False, default=0),
     Column("llm_calls", BigInteger, nullable=False, default=0),
+    # Calibration dataset: what the agent proposed and how sure it claimed
+    # to be. NULL for runs that never reached a decision (evidence_failed,
+    # budget_exceeded, ...). Human approval/escalation outcomes are the
+    # labels these will eventually be plotted against.
+    Column("confidence", Float, nullable=True),
+    Column("proposed_action", String(32), nullable=True),
     Column("detail", JSON, nullable=False, default=dict),
     Column("created_at", DateTime(timezone=True), nullable=False,
            default=lambda: datetime.now(timezone.utc)),
@@ -40,10 +46,12 @@ agent_runs = Table(
 _UPSERT = text("""
 INSERT INTO agent_runs
     (run_id, dispute_id, status, summary, input_tokens, output_tokens,
-     total_tokens, cost_usd, llm_calls, detail, created_at, updated_at)
+     total_tokens, cost_usd, llm_calls, confidence, proposed_action,
+     detail, created_at, updated_at)
 VALUES
     (:run_id, :dispute_id, :status, :summary, :input_tokens, :output_tokens,
-     :total_tokens, :cost_usd, :llm_calls, CAST(:detail AS JSON), now(), now())
+     :total_tokens, :cost_usd, :llm_calls, :confidence, :proposed_action,
+     CAST(:detail AS JSON), now(), now())
 ON CONFLICT (run_id) DO UPDATE SET
     status = EXCLUDED.status,
     summary = EXCLUDED.summary,
@@ -52,6 +60,8 @@ ON CONFLICT (run_id) DO UPDATE SET
     total_tokens = EXCLUDED.total_tokens,
     cost_usd = EXCLUDED.cost_usd,
     llm_calls = EXCLUDED.llm_calls,
+    confidence = EXCLUDED.confidence,
+    proposed_action = EXCLUDED.proposed_action,
     detail = EXCLUDED.detail,
     updated_at = now()
 """)
@@ -66,6 +76,14 @@ class RunLog:
 
     def init(self) -> None:
         _metadata.create_all(self._engine)
+        # The agent database has no migration tool, and create_all() never
+        # ALTERs an existing table. Additive columns are applied idempotently
+        # here so databases created by earlier versions catch up on boot.
+        with self._engine.begin() as conn:
+            conn.execute(text("ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS "
+                              "confidence DOUBLE PRECISION"))
+            conn.execute(text("ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS "
+                              "proposed_action VARCHAR(32)"))
 
     def write(self, record: dict) -> None:
         usage = record.get("usage") or {}
@@ -80,6 +98,8 @@ class RunLog:
                 "total_tokens": usage.get("total_tokens", 0),
                 "cost_usd": usage.get("cost_usd", 0),
                 "llm_calls": usage.get("llm_calls", 0),
+                "confidence": record.get("confidence"),
+                "proposed_action": record.get("proposed_action"),
                 "detail": json.dumps(record, default=str),
             })
 

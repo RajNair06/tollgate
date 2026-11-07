@@ -18,9 +18,12 @@ AI agent ──(X-API-Key)──▶ FastAPI ──/v1/agent-actions──┐
                          PostgreSQL (decisions, caps, audit, outbox)
                              │
                          approvals (human-in-the-loop) ──▶ PayPal refunds
+                             ▲
+   dispute agent (agent/) ═══╝  LangGraph + Gemini, talks MCP only,
+                                checkpoints its own state in PostgreSQL
 ```
 
-Three subsystems, one repo:
+Four subsystems, one repo:
 
 - **Policy engine** (PostgreSQL + Redis): agent identity, per-agent policies,
   atomic spending caps, approval workflow, append-only audit log.
@@ -33,6 +36,10 @@ Three subsystems, one repo:
   to AI agents as Model Context Protocol tools over streamable HTTP at
   `/mcp` — money-moving tools run the full policy engine before touching
   PayPal.
+- **Dispute agent** (`agent/`): an autonomous LangGraph agent that consumes
+  the MCP server as its only doorway — evidence gathering, LLM-drafted
+  dispute responses, a hallucination-checking critic, a schema-validated
+  refund decision, and a durable interrupt/resume across human approvals.
 
 ## Data model (8 tables, `gateway/models.py`)
 
@@ -109,6 +116,7 @@ own, so identity is re-resolved (and re-audited on failure) per call.
 | `get_dispute` | identity only | One dispute in full (`PP-D-*` id) |
 | `issue_refund` | **full engine** | Refund a capture: allowlist → caps → threshold. `allowed` executes on PayPal immediately with a deterministic `PayPal-Request-Id` (uuid5 of the action id — retries can't double-refund); `pending_approval` creates an approval and moves nothing |
 | `create_order` | **full engine** | Create an order (intent=CAPTURE, no money moves); requires `create_order` in the agent's `allowed_actions` |
+| `execute_approved_refund` | approval state machine | Executes a refund a human approved (`approved` → PayPal → `executed`/`failed`). Deterministic `PayPal-Request-Id` per action; replaying an executed approval returns the recorded outcome without touching PayPal |
 
 Input schemas are strict: 17-char `[A-Z0-9]` transaction IDs, `PP-D-\d+`
 dispute IDs, amounts as positive decimal **strings** (max 2dp), a currency
@@ -128,6 +136,88 @@ MCP client configuration (e.g. for any MCP-compatible agent harness):
   "url": "http://localhost:8000/mcp",
   "headers": {"Authorization": "Bearer tg_..."}}}}
 ```
+
+## Dispute agent (`agent/`)
+
+An autonomous agent that handles PayPal disputes end to end. It holds a
+regular agent API key (`tg_...`) and talks to the gateway **only** through
+the MCP server — it never touches PayPal, the gateway database, or any
+state of its own beyond its checkpoints. Every money move therefore passes
+the same policy engine, caps, and audit trail as any other agent.
+
+Two generations live side by side:
+
+- `loop_agent.py` — a hand-built prompt→tool-call→tool-output loop
+  (registry, Gemini function calling, iteration cap). The mechanics,
+  visible.
+- `graph.py` — the production shape: a LangGraph `StateGraph`.
+
+```
+gather_evidence ─▶ draft_response ─▶ critic ─▶ decide_refund ─▶ request_refund ─▶ execute_refund ─▶ finalize
+   (MCP reads,     (Gemini drafts    (LLM +     (Pydantic        (MCP issue_       (interrupt ⇄        (run log,
+    no LLM)         from evidence)    regex      RefundDecision,   refund with       resume after        status)
+                                      scan)      fail-closed)      run-id key)       human approval)
+```
+
+Guards worth knowing:
+
+- **One-pass critic, no revision loop.** Every 17-char-ID-shaped and
+  timestamp-shaped token in the draft must appear verbatim in the evidence
+  JSON (deterministic scan), and an LLM fact-check verdict must say
+  `supported` — unparseable verdicts fail closed. A rejected draft ends the
+  run (`rejected_by_critic`); it is never sent back for rewording, so a
+  hallucination cannot be laundered by a rewrite.
+- **The decision is a schema, not prose.** `RefundDecision`
+  (`extra="forbid"`) enforces the gateway's ID/timestamp regexes, refund > 0
+  only with `issue_refund`, cited transaction IDs that exist in the
+  evidence, refund ≤ transaction amount, and confidence < 0.6 ⇒
+  `escalate_human`. Validation failure is a terminal `schema_failed` status.
+- **Approval pauses the graph, durably.** `pending_approval` triggers a
+  LangGraph `interrupt()`; the state is checkpointed in PostgreSQL
+  (`langgraph-checkpoint-postgres`, its own `agent` database). The process
+  can die — a fresh process resumes by thread id, calls the gateway's
+  `execute_approved_refund`, and finishes. Proven by a test that runs the
+  interrupt and the resume in two separate OS processes.
+- **Budgets and retries.** Each run gets a `RunMeter`: unique run id, hard
+  token budget checked *before* every call, and USD cost from a static
+  price table. Transient Gemini failures (429/5xx/network) retry with
+  exponential backoff + jitter; 4xx do not.
+- Telemetry lands in `agent_runs` (status, in/out tokens, cost, LLM calls)
+  in the agent database.
+
+Running it:
+
+```bash
+# env: GEMINI_API_KEY, AGENT_API_KEY (the agent's tg_ key), optional:
+# AGENT_MODEL (default gemini-3.8-flash), AGENT_MCP_URL, AGENT_DATABASE_URL,
+# AGENT_TOKEN_BUDGET, AGENT_PROMPT_VERSION
+
+uv run python -m agent.run_dispute PP-D-56244        # fresh run
+# → pauses with an interrupt payload when the gateway demands approval:
+#   {"paused": "approval_required", "interrupt": {"approval_id": 4, ...},
+#    "resume_with": "uv run python -m agent.run_dispute --resume run-... --approved"}
+
+# human decides the approval via the gateway (POST /v1/approvals/4/decision), then:
+uv run python -m agent.run_dispute --resume run-... --approved   # or --rejected
+```
+
+Live proof (sandbox, `gemini-3.1-flash-lite`; `gemini-3.8-flash` was
+returning 503 high-demand at demo time — the retry ladder with jitter
+handled it exactly as designed before the model fallback):
+
+- Loop agent, read task: batched `get_transaction` + `list_disputes` MCP
+  calls in one turn, final answer matched the sandbox facts
+  (`PARTIALLY_REFUNDED`, 10.99 USD, 0 disputes).
+- Loop agent, money task: `issue_refund` 1.00 USD → policy `allowed`
+  (action 67, rolling 1.00/50.00) → real sandbox refund
+  `3X348304RB917380X` COMPLETED; gateway audit shows `allowed/OK` then
+  `executed/PAYPAL_REFUND_COMPLETED`.
+- Meter for both tasks: 4 LLM calls, 4,356 in / 247 out tokens,
+  **$0.001459**, under the 20k budget.
+- CLI graph run against a nonexistent dispute: real gateway
+  `RESOURCE_NOT_FOUND` (PayPal `debug_id` included) → terminal
+  `evidence_failed` with 0 LLM calls; checkpoint + `agent_runs` rows
+  verified in PostgreSQL.
 
 ## Requirements
 
@@ -217,7 +307,7 @@ executed end-to-end (real refund `92F13256LW3371821`, audit rows
 ## Tests
 
 ```bash
-uv run pytest        # 74 tests, ~1.5 min — requires the Docker containers running
+uv run pytest        # 119 tests, ~2 min — requires the Docker containers running
 ```
 
 Runs against a real PostgreSQL test database (`tollgate_test`, created and
@@ -231,10 +321,19 @@ PayPal client is tested offline via `httpx.MockTransport` (token refresh,
 error mapping). The MCP server is tested end-to-end against a real uvicorn
 thread server and a real MCP client over streamable HTTP: discovery,
 unauthorized calls (missing/invalid/revoked keys, audited), invalid
-parameters, denied/pending/deduplicated/allowed-executed refunds, cap
-reservation across tools, and PayPal-failure auditing — with a
-MockTransport PayPal injected through the same `init_paypal_client()` seam
-`main.py` uses.
+parameters, denied/pending/deduplicated/allowed-executed refunds,
+approved-refund execution (incl. replay idempotence, ownership, and
+PayPal-failure → `failed`), cap reservation across tools, and
+PayPal-failure auditing — with a MockTransport PayPal injected through the
+same `init_paypal_client()` seam `main.py` uses.
+
+The agent is tested without network: `ScriptedLLM`/`FakeLLM` script Gemini
+(including retry/backoff/jitter behavior against real `google.genai.errors`
+exceptions) and `FakeRegistry` scripts the gateway — but the LangGraph
+checkpointer is **real PostgreSQL** (`agent_test` database). The durability
+test runs the graph to the approval interrupt in a subprocess, lets the
+process exit, and resumes in a second subprocess: state is carried by
+PostgreSQL alone.
 
 
 
@@ -260,10 +359,25 @@ gateway/
   admin.py              admin provisioning endpoints
   mcp_server.py         MCP tools (streamable HTTP), header auth, PayPal execution glue
 alembic/                migrations (schema → perf index → agent_keys)
+agent/
+  config.py             env-driven agent settings (MCP url, keys, model, budget)
+  gemini_client.py      Gemini wrapper: backoff+jitter, error classes, metering
+  budget.py             RunMeter: run id, token budget, USD cost table
+  tools.py              tool registry + MCP bridge (errors are data, never raises)
+  loop_agent.py         hand-built prompt/tool loop with iteration cap
+  prompts.py            versioned prompt loader (fail-loud)
+  prompts/v1/           loop system, draft, critic, decision prompts
+  state.py              AgentState + RefundDecision/CitedEvidence schemas
+  graph.py              LangGraph: nodes, critic guards, routing, interrupt
+  checkpoint.py         agent-database bootstrap + PostgresSaver
+  runs.py               agent_runs telemetry table (upsert)
+  run_dispute.py        CLI: fresh runs + --resume --approved/--rejected
+  testing.py            ScriptedLLM/FakeRegistry + canned gateway envelopes
 scripts/
   create_agent.py       CLI provisioning (prints key once)
   toll_flow.py          live PayPal sandbox end-to-end demo
-tests/                  74 tests (real Postgres + MockTransport + real MCP over HTTP)
+tests/                  119 tests (real Postgres + MockTransport + real MCP over HTTP
+                        + scripted-LLM agent tests + cross-process resume proof)
 ```
 
 ## License

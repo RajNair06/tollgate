@@ -355,3 +355,11 @@ def test_unknown_model_costs_zero_without_crashing():
     meter = RunMeter(model="future-model-9", budget_tokens=100)
     meter.charge(50, 10)
     assert meter.cost_usd == 0.0
+
+
+def test_default_model_has_a_pricing_entry():
+    """Model catalogs drift (a live 404 taught us this). If the default
+    model has no price, every run would silently record cost 0."""
+    from agent.budget import PRICING_USD_PER_MTOK
+    from agent.gemini_client import DEFAULT_MODEL
+    assert DEFAULT_MODEL in PRICING_USD_PER_MTOK

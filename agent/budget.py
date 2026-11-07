@@ -22,7 +22,11 @@ class LLMBudgetExceeded(Exception):
 
 
 # USD per 1M tokens, (input, output). Extend as models are added.
+# gemini-3.8-flash pricing per aistudio.google.com/docs/pricing as of
+# 2026-11 (introductory rate valid through 2026-12-31).
 PRICING_USD_PER_MTOK: dict[str, tuple[float, float]] = {
+    "gemini-3.8-flash": (0.75, 3.75),
+    "gemini-3.1-flash-lite": (0.25, 1.50),
     "gemini-2.5-flash": (0.30, 2.50),
     "gemini-2.5-pro": (1.25, 10.00),
     "gemini-2.0-flash": (0.15, 0.60),

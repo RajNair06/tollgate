@@ -29,7 +29,7 @@ from agent.budget import LLMBudgetExceeded, RunMeter
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.8-flash"
 
 # HTTP statuses worth retrying: rate limit + server-side transients.
 _TRANSIENT_STATUS = {408, 425, 429, 500, 502, 503, 504}
@@ -169,11 +169,15 @@ class GeminiClient:
             FunctionCall(name=fc.name, args=dict(fc.args or {}))
             for fc in (response.function_calls or [])
         )
+        # Accessing response.text when the model returned function_call parts
+        # makes the SDK emit a warning; the text is empty-ish anyway. Only
+        # read it for text responses.
+        text = "" if calls else (response.text or "")
         if self.meter is not None:
             self.meter.charge(input_tokens, output_tokens)
 
         return LLMResult(
-            text=response.text or "",
+            text=text,
             function_calls=calls,
             content=raw_content,
             input_tokens=input_tokens,

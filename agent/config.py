@@ -36,7 +36,7 @@ def get_agent_settings() -> AgentSettings:
         mcp_url=os.environ.get("AGENT_MCP_URL", "http://localhost:8000/mcp").strip(),
         gateway_api_key=os.environ.get("AGENT_API_KEY", "").strip(),
         gemini_api_key=os.environ.get("GEMINI_API_KEY", "").strip(),
-        model=os.environ.get("AGENT_MODEL", "gemini-2.5-flash").strip(),
+        model=os.environ.get("AGENT_MODEL", "gemini-3.8-flash").strip(),
         token_budget=int(os.environ.get("AGENT_TOKEN_BUDGET", "100000")),
         database_url=os.environ.get(
             "AGENT_DATABASE_URL",

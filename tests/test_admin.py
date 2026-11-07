@@ -196,6 +196,140 @@ def test_revoked_key_audit_trail(client):
 
 
 # ---------------------------------------------------------------------------
+# PATCH /v1/admin/agents/{id} — kill switch + policy updates
+# ---------------------------------------------------------------------------
+
+def _patch(client, agent_id, **fields):
+    return client.patch(f"/v1/admin/agents/{agent_id}", headers=AH,
+                        json={"actor": "ops-test", **fields})
+
+
+def test_deactivate_locks_out_running_server(client):
+    created = client.post("/v1/admin/agents", headers=AH,
+                          json=_create_body()).json()
+    aid, key = created["agent_id"], created["api_key"]
+    assert _action_call(client, key).status_code == 200
+
+    r = _patch(client, aid, is_active=False)
+    assert r.status_code == 200
+    assert r.json()["is_active"] is False
+
+    # Dies on the RUNNING server: auth reads is_active per request.
+    blocked = _action_call(client, key)
+    assert blocked.status_code == 403
+    assert blocked.json()["detail"]["reason_code"] == "AGENT_INACTIVE"
+
+    # Re-enabling through the same endpoint works immediately too.
+    assert _patch(client, aid, is_active=True).json()["is_active"] is True
+    assert _action_call(client, key).status_code == 200
+
+
+def test_policy_update_takes_effect_immediately(client):
+    created = client.post("/v1/admin/agents", headers=AH,
+                          json=_create_body()).json()
+    aid, key = created["agent_id"], created["api_key"]
+
+    # Rolling cap below one $10 action → the NEXT call is denied.
+    r = _patch(client, aid, rolling_24h_cap="5.00")
+    assert r.json()["policy"]["rolling_24h_cap"] == "5.00"
+    denied = _action_call(client, key)
+    assert denied.status_code == 200  # the decision IS the payload
+    assert denied.json()["outcome"] == "denied"
+    assert denied.json()["reason_code"] == "ROLLING_24H_CAP_EXCEEDED"
+
+    # Narrowed allowlist → refund is no longer this agent's business
+    # (cap restored so the denial we observe is the allowlist one).
+    _patch(client, aid, rolling_24h_cap="100.00",
+           allowed_actions=["create_order"])
+    denied = _action_call(client, key)
+    assert denied.json()["reason_code"] == "ACTION_NOT_ALLOWED"
+
+
+def test_invariant_checked_against_effective_values(client):
+    created = client.post("/v1/admin/agents", headers=AH,
+                          json=_create_body()).json()
+    aid = created["agent_id"]
+
+    # Shrinking per_txn below the EXISTING threshold is caught...
+    r = _patch(client, aid, per_txn_cap="5.00")
+    assert r.status_code == 422
+    assert r.json()["detail"]["reason_code"] == "POLICY_INVARIANT_VIOLATED"
+
+    # ...unless the same request restores coherence (fields merge, they are
+    # not applied one endpoint-at-a-time).
+    r = _patch(client, aid, per_txn_cap="5.00", approval_threshold="4.00")
+    assert r.status_code == 200
+    assert r.json()["policy"]["per_txn_cap"] == "5.00"
+    assert r.json()["policy"]["approval_threshold"] == "4.00"
+
+
+def test_partial_patch_leaves_other_fields_untouched(client):
+    created = client.post("/v1/admin/agents", headers=AH,
+                          json=_create_body()).json()
+    before = client.get(f"/v1/admin/agents/{created['agent_id']}",
+                        headers=AH).json()["policy"]
+    after = _patch(client, created["agent_id"], is_active=False).json()
+    assert after["policy"] == before
+    assert after["is_active"] is False
+
+
+def test_patch_validation_edges(client):
+    created = client.post("/v1/admin/agents", headers=AH,
+                          json=_create_body()).json()
+    aid = created["agent_id"]
+
+    # Actor only → nothing to update.
+    r = client.patch(f"/v1/admin/agents/{aid}", headers=AH,
+                     json={"actor": "ops-test"})
+    assert r.status_code == 422
+    assert r.json()["detail"]["reason_code"] == "NOTHING_TO_UPDATE"
+
+    # Explicit null: PATCH updates fields, it never removes them.
+    r = _patch(client, aid, is_active=None)
+    assert r.status_code == 422
+    assert r.json()["detail"]["reason_code"] == "NULL_NOT_ALLOWED"
+
+    assert _patch(client, 999999, is_active=False).status_code == 404
+    assert client.patch(f"/v1/admin/agents/{aid}", headers=AH,
+                        json={"is_active": False}).status_code == 422  # actor
+    assert _patch(client, aid, allowed_actions=[]).status_code == 422
+    assert _patch(client, aid, bogus_field=1).status_code == 422
+
+    # None of the rejected patches above left an audit trail.
+    with session_scope() as s:
+        n = s.execute(select(func.count()).select_from(AuditLog).where(
+            AuditLog.agent_id == aid,
+            AuditLog.decision == "agent_updated")).scalar_one()
+    assert n == 0
+
+
+def test_update_is_audited_with_diff(client):
+    created = client.post("/v1/admin/agents", headers=AH,
+                          json=_create_body()).json()
+    aid = created["agent_id"]
+    _patch(client, aid, is_active=False, rolling_24h_cap="50.00")
+    with session_scope() as s:
+        row = s.execute(select(AuditLog).where(
+            AuditLog.agent_id == aid,
+            AuditLog.decision == "agent_updated")).scalar_one()
+    assert row.detail["actor"] == "ops-test"
+    assert row.detail["changes"]["is_active"] == {"before": True, "after": False}
+    assert row.detail["changes"]["rolling_24h_cap"] == {
+        "before": "100.00", "after": "50.00"}
+
+
+def test_agent_key_is_not_an_admin_key_for_updates(client, make_agent):
+    # Separation of duties holds for the kill switch too.
+    created = client.post("/v1/admin/agents", headers=AH,
+                          json=_create_body()).json()
+    _, other_key = make_agent()
+    r = client.patch(f"/v1/admin/agents/{created['agent_id']}",
+                     headers={"X-Admin-Key": other_key},
+                     json={"actor": "sneaky", "is_active": False})
+    assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
 # Ops views
 # ---------------------------------------------------------------------------
 

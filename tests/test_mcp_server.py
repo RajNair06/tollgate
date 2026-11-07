@@ -238,6 +238,17 @@ def test_revoked_key_rejected(server, make_agent):
     assert "API_KEY_REVOKED" in str(exc.value)
 
 
+def test_inactive_agent_rejected_and_audited(server, make_agent):
+    # The kill switch: is_active=False (what PATCH /v1/admin/agents/{id}
+    # flips) locks every MCP tool out immediately — auth reads the DB per
+    # request, nothing caches.
+    _, key = make_agent(active=False)
+    with pytest.raises(ToolError) as exc:
+        call_tool(server, key, "get_transaction", {"transaction_id": CAPTURE_ID})
+    assert "AGENT_INACTIVE" in str(exc.value)
+    assert _latest_audit("AGENT_INACTIVE") is not None
+
+
 # ---------------------------------------------------------------------------
 # Validation (checklist: invalid parameters)
 # ---------------------------------------------------------------------------

@@ -96,16 +96,21 @@ the DB CHECKs at the edge.
 | Endpoint | Purpose |
 |---|---|
 | `POST /v1/admin/agents` | Provision agent + policy + first key. **Plaintext key returned once, never retrievable again** |
+| `PATCH /v1/admin/agents/{id}` | Partial update: the `is_active` kill switch and/or any policy field (allowlist, caps, threshold, TTL). Body needs `actor` (self-reported operator identity, recorded in the audit diff) + ≥1 change field. Deactivation is immediate on every surface — HTTP authorize, all MCP tools, approval execution — and pending approvals are left for the expiry sweep |
 | `POST /v1/admin/agents/{id}/keys` | Issue an additional key (rotation: both keys live until the old one is revoked) |
 | `DELETE /v1/admin/keys/{key_id}` | Soft-revoke (idempotent). Takes effect on the running server immediately |
 | `GET /v1/admin/agents[/{id}]` | Ops views: policy + key prefixes (never hashes) |
 
 The admin credential is deliberately an env-var bootstrap secret, **not** an
 agent key — agents cannot provision or approve as admins. Because auth does a
-fresh DB read per request, keys issued or revoked through these endpoints are
-live on the next request with no restart (verified with a 50-cycle
-create→use-immediately hammer). Mutating handlers **commit before returning**
-so a client acting instantly on a response can never outrun the commit.
+fresh DB read per request, keys issued or revoked and agents deactivated or
+re-policed through these endpoints are live on the next request with no
+restart (verified with a 50-cycle create→use-immediately hammer). Mutating
+handlers **commit before returning** so a client acting instantly on a
+response can never outrun the commit. Every mutation is audited
+(`agent_created` / `agent_updated` / `key_issued` / `key_revoked`) in the
+same transaction as the change; `agent_updated` carries the actor and a
+before/after diff of exactly the fields that changed.
 
 ### MCP server (`/mcp`, streamable HTTP)
 
@@ -322,7 +327,7 @@ executed end-to-end (real refund `92F13256LW3371821`, audit rows
 ## Tests
 
 ```bash
-uv run pytest        # 127 tests, ~2.5 min — requires the Docker containers running
+uv run pytest        # 135 tests, ~3 min — requires the Docker containers running
 ```
 
 Runs against a real PostgreSQL test database (`tollgate_test`, created and
@@ -331,7 +336,8 @@ tests) because the correctness claims under test — `SELECT FOR UPDATE`
 serialization, partial unique indexes, CHECK constraints — are PostgreSQL
 behavior. Coverage: policy outcomes and caps, dedup, approval lifecycle and
 expiry, 50-thread concurrency (allowed path and pending-reservation path),
-API auth/validation/rate-limiting, admin provisioning and key rotation. The
+API auth/validation/rate-limiting, admin provisioning, key rotation, and the
+agent-update endpoint (kill switch + live policy changes, audit diffs). The
 PayPal client is tested offline via `httpx.MockTransport` (token refresh,
 error mapping). The MCP server is tested end-to-end against a real uvicorn
 thread server and a real MCP client over streamable HTTP: discovery,
@@ -372,7 +378,7 @@ gateway/
   redis_client.py       token cache + fixed-window rate limits
   schemas.py            strict Pydantic request/response models
   routes.py             agent-facing endpoints
-  admin.py              admin provisioning endpoints
+  admin.py              admin endpoints (create/patch agents, keys, views)
   mcp_server.py         MCP tools (streamable HTTP), header auth, PayPal execution glue
 alembic/                migrations (schema → perf index → agent_keys)
 agent/
@@ -392,7 +398,7 @@ agent/
 scripts/
   create_agent.py       CLI provisioning (prints key once)
   toll_flow.py          live PayPal sandbox end-to-end demo
-tests/                  127 tests (real Postgres + MockTransport + real MCP over HTTP
+tests/                  135 tests (real Postgres + MockTransport + real MCP over HTTP
                         + scripted-LLM agent tests + cross-process resume proof)
 ```
 

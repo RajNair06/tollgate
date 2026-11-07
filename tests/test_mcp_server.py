@@ -543,6 +543,162 @@ def test_execute_paypal_failure_marks_approval_failed(server, make_agent):
 
 
 # ---------------------------------------------------------------------------
+# Rolling-cap release: definite vs ambiguous execution failures
+# ---------------------------------------------------------------------------
+
+def _failing_paypal(mode: str, calls: list[httpx.Request] | None = None) -> PayPalClient:
+    """Mock PayPal whose refund endpoint fails.
+
+    mode: "422" (definite business rejection), "500" (ambiguous server
+    error), "timeout" (ambiguous transport failure).
+    """
+    calls = calls if calls is not None else []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.url.path == "/v1/oauth2/token":
+            return httpx.Response(200, json={
+                "access_token": "t", "expires_in": 32400})
+        if request.url.path.endswith("/refund"):
+            if mode == "timeout":
+                raise httpx.ConnectTimeout("connection timed out")
+            status = int(mode)
+            return httpx.Response(status, json={
+                "name": "INVALID_REQUEST" if status == 422 else "INTERNAL_ERROR",
+                "message": "refund failed", "debug_id": f"dbg-{mode}"})
+        return httpx.Response(200, json={
+            "id": CAPTURE_ID, "status": "COMPLETED",
+            "amount": {"value": "12.99", "currency_code": "USD"}})
+
+    return PayPalClient("id", "secret", "https://mock.paypal.invalid",
+                        transport=httpx.MockTransport(handler))
+
+
+def _allowed_action(idem_key: str) -> Action:
+    with session_scope() as s:
+        return s.execute(select(Action).where(
+            Action.idempotency_key == idem_key,
+            Action.outcome == "allowed")).scalar_one()
+
+
+def test_definite_paypal_failure_releases_rolling_cap(server, make_agent, fresh_mock):
+    # Rolling cap 25: the second $20 refund fits ONLY if the failed first
+    # one released its reservation (20 + 20 > 25).
+    _, key = make_agent(per_txn="100.00", rolling="25.00", threshold="100.00")
+
+    init_paypal_client(_failing_paypal("422", fresh_mock))
+    with pytest.raises(ToolError) as exc:
+        call_tool(server, key, "issue_refund", {
+            "capture_id": CAPTURE_ID, "amount": "20.00",
+            "idempotency_key": "rel-def-0001"})
+    assert "dbg-422" in str(exc.value)
+
+    # The failure was definite → stamped + audit says the cap was released.
+    assert _allowed_action("rel-def-0001").execution_failed_at is not None
+    audit_row = _latest_audit("PAYPAL_REFUND_FAILED")
+    assert audit_row.detail["cap_reservation_released"] is True
+
+    # Same amount again with a fresh key → allowed and executed.
+    init_paypal_client(_mock_paypal(fresh_mock))
+    result = call_tool(server, key, "issue_refund", {
+        "capture_id": CAPTURE_ID, "amount": "20.00",
+        "idempotency_key": "rel-def-0002"})
+    d = result.data["decision"]
+    assert d["outcome"] == "allowed"
+    assert d["rolling_24h_used"] == "20.00"  # only the new refund counts
+    assert result.data["refund"]["id"] == "2VF20713Y24658739"
+
+
+@pytest.mark.parametrize("mode", ["500", "timeout"])
+def test_ambiguous_paypal_failure_keeps_reservation(server, make_agent,
+                                                    fresh_mock, mode):
+    # The money MAY have moved (5xx / lost answer) → reservation stays, and
+    # a second refund that would exceed the cap is denied.
+    _, key = make_agent(per_txn="100.00", rolling="25.00", threshold="100.00")
+
+    init_paypal_client(_failing_paypal(mode, fresh_mock))
+    with pytest.raises(ToolError):
+        call_tool(server, key, "issue_refund", {
+            "capture_id": CAPTURE_ID, "amount": "20.00",
+            "idempotency_key": f"rel-amb-{mode}"})
+
+    assert _allowed_action(f"rel-amb-{mode}").execution_failed_at is None
+    audit_row = _latest_audit("PAYPAL_REFUND_FAILED")
+    assert audit_row.detail["cap_reservation_released"] is False
+
+    init_paypal_client(_mock_paypal(fresh_mock))
+    result = call_tool(server, key, "issue_refund", {
+        "capture_id": CAPTURE_ID, "amount": "20.00",
+        "idempotency_key": f"rel-amb-{mode}-2"})
+    d = result.data["decision"]
+    assert d["outcome"] == "denied"
+    assert d["reason_code"] == "ROLLING_24H_CAP_EXCEEDED"
+    assert d["rolling_24h_used"] == "20.00"  # the ambiguous one still counts
+    # The denied refund never reached PayPal: only the failed attempt did.
+    assert len([p for p in _paypal_paths(fresh_mock)
+                if p.endswith("/refund")]) == 1
+
+
+def test_replay_after_definite_failure_flags_execution_failed(server, make_agent,
+                                                              fresh_mock):
+    # Decisions replay, they do not re-execute: the same key returns the
+    # dedup envelope — now carrying the execution-failure flag so the agent
+    # knows to retry with a NEW key.
+    _, key = make_agent(per_txn="100.00", rolling="25.00", threshold="100.00")
+
+    init_paypal_client(_failing_paypal("422", fresh_mock))
+    with pytest.raises(ToolError):
+        call_tool(server, key, "issue_refund", {
+            "capture_id": CAPTURE_ID, "amount": "20.00",
+            "idempotency_key": "rel-replay-0001"})
+
+    init_paypal_client(_mock_paypal(fresh_mock))
+    result = call_tool(server, key, "issue_refund", {
+        "capture_id": CAPTURE_ID, "amount": "20.00",
+        "idempotency_key": "rel-replay-0001"})  # SAME key
+    d = result.data["decision"]
+    assert d["outcome"] == "deduplicated"
+    assert d["original_outcome"] == "allowed"
+    assert d["original_execution_failed"] is True
+    assert "NEW idempotency key" in result.data["summary"]
+    # The replay did not execute anything: still just the one failed attempt.
+    assert len([p for p in _paypal_paths(fresh_mock)
+                if p.endswith("/refund")]) == 1
+
+
+def test_approved_execution_failure_releases_via_approval_status(server, make_agent,
+                                                                 fresh_mock):
+    # The pending path releases through the approvals join (status 'failed'
+    # is not cap-reserving) — even for an AMBIGUOUS failure. Locked in so a
+    # refactor cannot silently regress it. Threshold 21: $22 parks, $20 runs.
+    _, key = make_agent(per_txn="100.00", rolling="25.00", threshold="21.00")
+
+    pending = call_tool(server, key, "issue_refund", {
+        "capture_id": CAPTURE_ID, "amount": "22.00",
+        "idempotency_key": "rel-appr-0001"})
+    approval_id = pending.data["decision"]["approval_id"]
+    assert pending.data["decision"]["outcome"] == "pending_approval"
+    _human_approve(approval_id)
+
+    init_paypal_client(_failing_paypal("500", fresh_mock))
+    with pytest.raises(ToolError):
+        call_tool(server, key, "execute_approved_refund",
+                  {"approval_id": approval_id})
+    with session_scope() as s:
+        assert s.get(Approval, approval_id).status == "failed"
+
+    # 22 released → a $20 refund fits under the 25 cap and executes.
+    init_paypal_client(_mock_paypal(fresh_mock))
+    result = call_tool(server, key, "issue_refund", {
+        "capture_id": CAPTURE_ID, "amount": "20.00",
+        "idempotency_key": "rel-appr-0002"})
+    d = result.data["decision"]
+    assert d["outcome"] == "allowed"
+    assert d["rolling_24h_used"] == "20.00"
+    assert result.data["refund"]["status"] == "COMPLETED"
+
+
+# ---------------------------------------------------------------------------
 # create_order through the gateway + policy
 # ---------------------------------------------------------------------------
 

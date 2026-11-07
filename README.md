@@ -8,20 +8,60 @@ money directly.
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    subgraph Clients
+        A1["AI agent<br/>X-API-Key"]
+        A2["MCP client<br/>Bearer tg_..."]
+        DA["Dispute agent<br/>LangGraph + Gemini"]
+    end
+
+    ADMIN["Operator<br/>X-Admin-Key"]
+    HUMAN["Human approver"]
+
+    subgraph Gateway["Toll Gate (FastAPI)"]
+        REST["REST routes<br/>/v1/agent-actions, /v1/approvals"]
+        MCP["MCP server<br/>/mcp (streamable HTTP)"]
+        AUTH["Auth + rate limit<br/>SHA-256 key lookup per request"]
+        ENGINE["Policy engine<br/>lock agent row, dedup,<br/>allowlist, caps, threshold"]
+        APPR["Approval workflow<br/>pending, approved, executed,<br/>rejected, expired, failed"]
+        ADM["Admin API<br/>agents, policies, keys, kill switch"]
+        PPC["PayPal client<br/>OAuth, idempotent requests"]
+    end
+
+    PG[("PostgreSQL<br/>agents, keys, policies, actions,<br/>approvals, audit, events, outbox")]
+    REDIS[("Redis<br/>rate-limit windows,<br/>token cache")]
+    AGENTDB[("Agent DB<br/>checkpoints, agent_runs")]
+    PAYPAL["PayPal API"]
+
+    A1 --> REST
+    A2 --> MCP
+    DA -->|MCP only| MCP
+    DA -.->|checkpoints| AGENTDB
+
+    REST --> AUTH
+    MCP --> AUTH
+    AUTH -.-> REDIS
+    AUTH --> ENGINE
+
+    ENGINE -->|"allowed"| PPC
+    ENGINE -->|"pending_approval"| APPR
+    ENGINE -->|"denied / deduplicated"| RESULT["Result returned to caller"]
+    ENGINE ==>|"one transaction:<br/>action + audit + event + outbox"| PG
+
+    APPR <--> HUMAN
+    APPR -->|"approved, then execute"| PPC
+    APPR --> PG
+
+    PPC --> PAYPAL
+    PPC -.-> REDIS
+
+    ADMIN --> ADM
+    ADM --> PG
 ```
-AI agent ──(X-API-Key)──▶ FastAPI ──/v1/agent-actions──┐
-                             │                          ▼
-   MCP client ══(Bearer tg_…)══ /mcp (streamable HTTP) ──▶ policy engine
-                             │  auth: SHA-256 lookup in agent_keys (per request, no cache)
-                             │  rate limit: Redis fixed windows (per-agent + global)
-                             ▼                          │
-                         PostgreSQL (decisions, caps, audit, outbox)
-                             │
-                         approvals (human-in-the-loop) ──▶ PayPal refunds
-                             ▲
-   dispute agent (agent/) ═══╝  LangGraph + Gemini, talks MCP only,
-                                checkpoints its own state in PostgreSQL
-```
+
+One process serves both doorways (REST + MCP); every request re-authenticates
+against PostgreSQL and Redis, and every decision lands in one transaction.
 
 Four subsystems, one repo:
 
@@ -166,12 +206,22 @@ Two generations live side by side:
   visible.
 - `graph.py` — the production shape: a LangGraph `StateGraph`.
 
+```mermaid
+flowchart LR
+    G["gather_evidence<br/>MCP reads, no LLM"] --> D["draft_response<br/>Gemini"]
+    D --> C["critic<br/>regex scan + LLM check"]
+    C -->|pass| R["decide_refund<br/>Pydantic RefundDecision"]
+    C -->|fail| X1(["rejected_by_critic"])
+    R -->|valid| Q["request_refund<br/>MCP issue_refund"]
+    R -->|invalid| X2(["schema_failed"])
+    Q -->|allowed| F["finalize"]
+    Q -->|pending_approval| E["execute_refund<br/>interrupt, resume after human"]
+    E --> F
+    G -->|error| X3(["evidence_failed"])
 ```
-gather_evidence ─▶ draft_response ─▶ critic ─▶ decide_refund ─▶ request_refund ─▶ execute_refund ─▶ finalize
-   (MCP reads,     (Gemini drafts    (LLM +     (Pydantic        (MCP issue_       (interrupt ⇄        (run log,
-    no LLM)         from evidence)    regex      RefundDecision,   refund with       resume after        status)
-                                      scan)      fail-closed)      run-id key)       human approval)
-```
+
+The graph only moves forward: every failure branch ends the run with a
+terminal status, and only a human approval can wake `execute_refund`.
 
 Guards worth knowing:
 

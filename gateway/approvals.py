@@ -60,8 +60,13 @@ def _load_for_update(session: Session, approval_id: int) -> Approval:
 
 
 def _transition(session: Session, approval: Approval, new_status: str,
-                reason_code: str, decided_by: str | None) -> None:
-    """Validate + apply a transition, then write audit/event/outbox rows."""
+                reason_code: str, decided_by: str | None,
+                detail: dict | None = None) -> None:
+    """Validate + apply a transition, then write audit/event/outbox rows.
+
+    detail: extra facts for the audit row (e.g. the PayPal refund id when
+    recording an execution result).
+    """
     allowed = APPROVAL_TRANSITIONS[approval.status]
     if new_status not in allowed:
         raise InvalidTransitionError(approval.id, approval.status, new_status)
@@ -80,7 +85,7 @@ def _transition(session: Session, approval: Approval, new_status: str,
         action_id=approval.action_id,
         amount=approval.action.amount if approval.action else None,
         detail={"approval_id": approval.id, "from": old_status, "to": new_status,
-                "decided_by": decided_by},
+                "decided_by": decided_by, **(detail or {})},
     )
     payload = {"approval_id": approval.id, "action_id": approval.action_id,
                "from": old_status, "to": new_status, "reason_code": reason_code}
@@ -105,16 +110,20 @@ def decide(session: Session, approval_id: int, decision: str,
 
 
 def mark_execution(session: Session, approval_id: int, executed: bool,
-                   reason_code: str | None = None) -> Approval:
+                   reason_code: str | None = None,
+                   detail: dict | None = None) -> Approval:
     """Post-execution bookkeeping: approved → executed | failed.
 
     Called after the gateway performed (or attempted) the PayPal refund.
+    detail lands in the audit row (e.g. {"refund_id": ...}).
     """
     approval = _load_for_update(session, approval_id)
     if executed:
-        _transition(session, approval, "executed", reason_code or RC_EXECUTED, None)
+        _transition(session, approval, "executed", reason_code or RC_EXECUTED,
+                    None, detail=detail)
     else:
-        _transition(session, approval, "failed", reason_code or RC_EXECUTION_FAILED, None)
+        _transition(session, approval, "failed", reason_code or RC_EXECUTION_FAILED,
+                    None, detail=detail)
     return approval
 
 

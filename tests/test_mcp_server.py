@@ -188,13 +188,13 @@ def _latest_audit(reason_code: str) -> AuditLog | None:
 # Discovery
 # ---------------------------------------------------------------------------
 
-def test_all_five_tools_are_listed(server, make_agent):
+def test_all_six_tools_are_listed(server, make_agent):
     _, key = make_agent()
     url, _ = server
     tools = asyncio.run(_list_tools(url, key))
     assert {t.name for t in tools} == {
         "get_transaction", "list_disputes", "get_dispute",
-        "issue_refund", "create_order",
+        "issue_refund", "create_order", "execute_approved_refund",
     }
 
 
@@ -420,6 +420,126 @@ def test_paypal_failure_is_audited_as_failed(server, make_agent):
 
     row = _latest_audit("PAYPAL_REFUND_FAILED")
     assert row is not None and row.decision == "failed"
+
+
+# ---------------------------------------------------------------------------
+# execute_approved_refund: the human-approval execution glue
+# ---------------------------------------------------------------------------
+
+def _make_pending_approval(key, server, idem="appr-0001", amount="22.00"):
+    """issue_refund above threshold → pending; returns (approval_id, action_id)."""
+    result = call_tool(server, key, "issue_refund", {
+        "capture_id": CAPTURE_ID, "amount": amount, "idempotency_key": idem})
+    d = result.data["decision"]
+    assert d["outcome"] == "pending_approval"
+    return d["approval_id"], d["action_id"]
+
+
+def _human_approve(approval_id: int):
+    from gateway import approvals as approvals_mod
+    with session_scope() as s:
+        approvals_mod.decide(s, approval_id, "approved", "ops-alice")
+
+
+def test_execute_approved_refund_happy_path(server, make_agent, fresh_mock):
+    _, key = make_agent(per_txn="100.00", rolling="500.00", threshold="20.00")
+    approval_id, action_id = _make_pending_approval(key, server)
+    _human_approve(approval_id)
+
+    result = call_tool(server, key, "execute_approved_refund",
+                       {"approval_id": approval_id})
+    payload = result.data
+    assert payload["ok"] is True
+    assert payload["refund"]["id"] == "2VF20713Y24658739"
+    assert payload["approval"]["status"] == "executed"
+
+    # Deterministic request id — the SAME scheme as issue_refund uses.
+    import uuid
+    from gateway.mcp_server import _PAYPAL_REQUEST_NS
+    expected = str(uuid.uuid5(_PAYPAL_REQUEST_NS,
+                              f"tollgate-refund-action-{action_id}"))
+    refund_calls = [c for c in fresh_mock if c.url.path.endswith("/refund")]
+    assert refund_calls[0].headers["PayPal-Request-Id"] == expected
+    # The refund used the action's stored amount, not a fresh argument.
+    assert json.loads(refund_calls[0].content)["amount"] == {
+        "value": "22.00", "currency_code": "USD"}
+
+    with session_scope() as s:
+        assert s.get(Approval, approval_id).status == "executed"
+    row = _latest_audit("PAYPAL_REFUND_COMPLETED")
+    assert row.decision == "executed"
+    assert row.detail["refund_id"] == "2VF20713Y24658739"
+    assert row.detail["approval_id"] == approval_id
+
+
+def test_execute_replay_is_idempotent(server, make_agent, fresh_mock):
+    _, key = make_agent(per_txn="100.00", rolling="500.00", threshold="20.00")
+    approval_id, _ = _make_pending_approval(key, server, idem="appr-0002")
+    _human_approve(approval_id)
+    first = call_tool(server, key, "execute_approved_refund",
+                      {"approval_id": approval_id})
+    assert first.data["ok"] is True
+    paypal_calls_after_first = len([c for c in fresh_mock
+                                    if c.url.path.endswith("/refund")])
+
+    second = call_tool(server, key, "execute_approved_refund",
+                       {"approval_id": approval_id})
+    assert second.data["already_executed"] is True
+    # PayPal was NOT called a second time.
+    assert len([c for c in fresh_mock
+                if c.url.path.endswith("/refund")]) == paypal_calls_after_first
+
+
+def test_execute_requires_approved_state(server, make_agent, fresh_mock):
+    _, key = make_agent(per_txn="100.00", rolling="500.00", threshold="20.00")
+    approval_id, _ = _make_pending_approval(key, server, idem="appr-0003")
+    # Still pending — nobody decided yet.
+    with pytest.raises(ToolError) as exc:
+        call_tool(server, key, "execute_approved_refund",
+                  {"approval_id": approval_id})
+    assert "INVALID_STATE" in str(exc.value)
+    assert _paypal_paths(fresh_mock) == []
+
+
+def test_execute_rejects_other_agents_approval(server, make_agent, fresh_mock):
+    _, key_a = make_agent(per_txn="100.00", rolling="500.00", threshold="20.00")
+    _, key_b = make_agent(per_txn="100.00", rolling="500.00", threshold="20.00")
+    approval_id, _ = _make_pending_approval(key_a, server, idem="appr-0004")
+    _human_approve(approval_id)
+    with pytest.raises(ToolError) as exc:
+        call_tool(server, key_b, "execute_approved_refund",
+                  {"approval_id": approval_id})
+    assert "APPROVAL_NOT_FOUND" in str(exc.value)  # existence not confirmed
+    assert _paypal_paths(fresh_mock) == []
+
+
+def test_execute_paypal_failure_marks_approval_failed(server, make_agent):
+    _, key = make_agent(per_txn="100.00", rolling="500.00", threshold="20.00")
+    approval_id, _ = _make_pending_approval(key, server, idem="appr-0005")
+    _human_approve(approval_id)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/oauth2/token":
+            return httpx.Response(200, json={
+                "access_token": "t", "expires_in": 32400})
+        return httpx.Response(500, json={
+            "name": "INTERNAL_SERVER_ERROR", "message": "paypal broke",
+            "debug_id": "fail-debug-9"})
+
+    init_paypal_client(PayPalClient(
+        "id", "secret", "https://mock.paypal.invalid",
+        transport=httpx.MockTransport(handler)))
+
+    with pytest.raises(ToolError) as exc:
+        call_tool(server, key, "execute_approved_refund",
+                  {"approval_id": approval_id})
+    assert "fail-debug-9" in str(exc.value)
+
+    with session_scope() as s:
+        assert s.get(Approval, approval_id).status == "failed"
+    row = _latest_audit("PAYPAL_REFUND_FAILED")
+    assert row.decision == "failed"
+    assert row.detail["approval_id"] == approval_id
 
 
 # ---------------------------------------------------------------------------

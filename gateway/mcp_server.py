@@ -47,9 +47,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from gateway import audit
+from gateway import approvals as approvals_mod
 from gateway.api_keys import hash_api_key
 from gateway.db import session_scope
-from gateway.models import Agent, AgentKey, Policy
+from gateway.models import Agent, AgentKey, Approval, Policy
 from gateway.paypal_client import (
     PayPalAPIError,
     PayPalClient,
@@ -445,6 +446,92 @@ def issue_refund(
                     f"{refund_amount['currency']} against capture {capture_id} "
                     f"(status {refund.get('status')})."),
         "decision": _decision_payload(decision),
+        "refund": {
+            "id": refund.get("id"),
+            "status": refund.get("status"),
+            "amount": refund_amount,
+            "paypal_request_id": request_id,
+        },
+    }
+
+
+@mcp.tool()
+def execute_approved_refund(
+    approval_id: Annotated[int, Field(gt=0, description="Approval id returned by issue_refund's pending_approval outcome.")],
+) -> dict:
+    """Execute a refund a human has approved (approval status 'approved').
+
+    This is the second half of the pending_approval path: issue_refund parks
+    the money, a human decides via the approvals API, and this tool performs
+    the actual PayPal refund and records the result (approved → executed |
+    failed) through the same locked, audited state-machine transition as
+    every other approval change.
+
+    Idempotent: replaying on an already-executed approval returns the
+    recorded outcome without calling PayPal again, and the PayPal request id
+    is deterministic per action, so even a crash between the PayPal call and
+    the status write cannot double-refund on retry.
+
+    Known simplification (same as the HTTP /execute endpoint): the caller
+    authenticates with an agent key — a separate operator identity is on the
+    patch list.
+    """
+    with session_scope() as session:
+        agent, policy = _authenticate(session)
+        approval = session.execute(
+            select(Approval).where(Approval.id == approval_id).with_for_update()
+        ).scalar_one_or_none()
+        # Ownership: cross-agent probes get NOT_FOUND (do not confirm existence).
+        if approval is None or approval.action.agent_id != agent.id:
+            raise ToolError(f"APPROVAL_NOT_FOUND: no approval #{approval_id} for this agent")
+
+        if approval.status == "executed":
+            # Idempotent replay: already done — report without touching PayPal.
+            return {
+                "ok": True, "already_executed": True,
+                "summary": f"Approval #{approval_id} was already executed.",
+                "approval": {"id": approval.id, "status": "executed",
+                             "reason_code": approval.reason_code},
+            }
+        if approval.status != "approved":
+            raise ToolError(
+                f"INVALID_STATE: approval #{approval_id} is '{approval.status}'; "
+                f"only 'approved' refunds can be executed")
+
+        action = approval.action
+        request_id = str(uuid.uuid5(
+            _PAYPAL_REQUEST_NS, f"tollgate-refund-action-{action.id}"))
+        try:
+            refund = _get_paypal().refund_capture(
+                action.reference_id, action.amount, action.currency,
+                request_id=request_id)
+        except PayPalError as exc:
+            approvals_mod.mark_execution(
+                session, approval.id, executed=False,
+                reason_code="PAYPAL_REFUND_FAILED",
+                detail={"capture_id": action.reference_id,
+                        "paypal_request_id": request_id,
+                        "error": _describe_paypal_error(exc)[:300]})
+            session.commit()  # commit the evidence before raising
+            raise ToolError(f"PAYPAL_ERROR: {_describe_paypal_error(exc)}") from exc
+
+        refund_amount = _money(refund.get("amount"))
+        approvals_mod.mark_execution(
+            session, approval.id, executed=True,
+            reason_code="PAYPAL_REFUND_COMPLETED",
+            detail={"capture_id": action.reference_id,
+                    "refund_id": refund.get("id"),
+                    "paypal_request_id": request_id})
+        session.commit()  # commit before you speak
+
+    return {
+        "ok": True,
+        "summary": (f"Approved refund executed: {refund.get('id')} "
+                    f"{refund_amount['value']} {refund_amount['currency']} "
+                    f"against capture {action.reference_id} "
+                    f"(status {refund.get('status')})."),
+        "approval": {"id": approval.id, "status": "executed",
+                     "reason_code": "PAYPAL_REFUND_COMPLETED"},
         "refund": {
             "id": refund.get("id"),
             "status": refund.get("status"),

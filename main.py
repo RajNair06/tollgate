@@ -14,6 +14,7 @@ from gateway.mcp_server import mcp as mcp_server
 from gateway.paypal_client import PayPalClient
 from gateway.redis_client import RedisTokenCache
 from gateway.routes import router
+from gateway.webhooks import webhook_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,6 +59,9 @@ mcp_app = mcp_server.http_app(path="/mcp", json_response=True)
 app = FastAPI(title="Toll Gate Gateway", version="0.6.0", lifespan=lifespan)
 app.include_router(router)
 app.include_router(admin_router)
+# Registered BEFORE the MCP catch-all mount below — Starlette matches routes
+# in registration order, so /webhooks/* must not fall through to the sub-app.
+app.include_router(webhook_router)
 
 
 @app.get("/health")

@@ -59,8 +59,10 @@ def _clean(_database):
 
     with session_scope() as s:
         # CASCADE reaches policies/actions/approvals/audit_log via FKs;
-        # events/outbox have no FKs and are truncated explicitly.
-        s.execute(text("TRUNCATE agents, events, outbox RESTART IDENTITY CASCADE"))
+        # events/outbox/webhook_* have no FKs and are truncated explicitly.
+        s.execute(text(
+            "TRUNCATE agents, events, outbox, webhook_events, webhook_outbox "
+            "RESTART IDENTITY CASCADE"))
     try:
         r = get_redis()
         stale = list(r.scan_iter(match="rl:*", count=500))

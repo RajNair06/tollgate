@@ -400,6 +400,51 @@ class PayPalClient:
             params["start_time"] = start_time
         return self._request("GET", "/v1/customer/disputes", params=params)
 
+    # -- Notifications v1: webhook signature verification -----------------------
+
+    def verify_webhook_signature(
+        self,
+        *,
+        auth_algo: str,
+        cert_url: str,
+        transmission_id: str,
+        transmission_sig: str,
+        transmission_time: str,
+        webhook_id: str,
+        webhook_event: dict,
+    ) -> bool:
+        """Ask PayPal whether a webhook delivery's signature is valid.
+
+        POST /v1/notifications/verify-webhook-signature with the five
+        transmission headers exactly as received, the webhook id the
+        endpoint was registered under, and the event body VERBATIM (any
+        re-serialization breaks the signature).
+
+        PayPal answers a bad signature with HTTP 200 and
+        {"verification_status": "FAILURE"} — so this returns a bool instead
+        of raising. Transport/API errors raise the usual PayPal* exceptions;
+        callers must fail closed (treat an unavailable verifier as
+        "not verified").
+        """
+        result = self._request(
+            "POST",
+            "/v1/notifications/verify-webhook-signature",
+            json_body={
+                "auth_algo": auth_algo,
+                "cert_url": cert_url,
+                "transmission_id": transmission_id,
+                "transmission_sig": transmission_sig,
+                "transmission_time": transmission_time,
+                "webhook_id": webhook_id,
+                "webhook_event": webhook_event,
+            },
+            request_id=new_request_id(),
+        )
+        status = result.get("verification_status")
+        logger.info("Webhook signature verification: %s (transmission %s)",
+                    status, transmission_id)
+        return status == "SUCCESS"
+
 
 # ---------------------------------------------------------------------------
 # Response helpers

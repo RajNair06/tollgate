@@ -167,11 +167,14 @@ function preRenderer(value, mono) {
 function evidenceRenderer(params) {
   const ev = (params.data && params.data.evidence_items) || [];
   if (!ev.length) return '<span class="muted">none cited</span>';
+  // All data text renders in the default cell color — no muted spans:
+  // every part of an evidence item (source, claim, value, txn id,
+  // observed time) is equally important to the operator.
   return ev.map((e) =>
     '<div class="ev-item"><b>' + esc(e.source) + "</b> · " + esc(e.claim) +
     (e.value != null ? " = <b>" + esc(e.value) + "</b>" : "") +
-    (e.transaction_id ? " <span class='muted'>txn " + esc(e.transaction_id) + "</span>" : "") +
-    (e.observed_at ? " <span class='muted'>@" + esc(e.observed_at) + "</span>" : "") +
+    (e.transaction_id ? " txn " + esc(e.transaction_id) : "") +
+    (e.observed_at ? " @" + esc(e.observed_at) : "") +
     "</div>").join("");
 }
 

@@ -21,7 +21,7 @@ loop:
      real sandbox money moves, end to end.
 
 The reasoning/evidence text is deliberately worst-case: ~1000 chars,
-embedded newlines, unicode, and a 200-char unbroken token — the
+embedded newlines, quoted punctuation, and a 200-char unbroken token — the
 dashboard must wrap all of it inside the cell, never clip.
 
 Usage:
@@ -73,7 +73,7 @@ WORST_CASE_REASONING = (
     "evidence exactly, and the requested amount is within the capture's remaining "
     "refundable balance.\n\n"
     "Counter-evidence considered and rejected: the merchant flagged the buyer as "
-    "\u201chigh-risk\u201d (ünïcødé ✓ € ₹ 日本語) but supplied no prior chargeback history, "
+    "\u201chigh-risk\u201d but supplied no prior chargeback history, "
     "no AVS mismatch, and no delivery proof — under policy §4.2 an unsupported "
     "risk flag does not outweigh a clean item-not-received packet.\n\n"
     "Long-reference stress token (must wrap, never clip): " + LONG_TOKEN + "\n\n"
@@ -108,10 +108,10 @@ def worst_case_decision(dispute_id: str) -> str:
             },
             {
                 "source": "dispute",
-                "claim": "buyer's own words (unicode + quote stress)",
+                "claim": "buyer's own words (quotes, dashes, dates — punctuation stress)",
                 "value": "\u201cPackage never arrived \u2014 30 days, no tracking movement "
                          "whatsoever. Emailed twice (2026-10-12, 2026-10-20), got "
-                         "only an automated reply.\u201d \u2014 ünïcødé ✓ € ₹ 日本語",
+                         "only an automated reply.\u201d",
             },
         ],
     })

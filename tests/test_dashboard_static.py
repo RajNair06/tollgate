@@ -80,3 +80,29 @@ def test_other_routes_survive_the_mount(client):
     assert client.get("/dashboard/nope.html").status_code == 404
     # /v1 routes still authenticate (401 without a key), not 404:
     assert client.get("/v1/admin/dashboard/metrics").status_code == 401
+
+
+def test_no_truncation_contract_is_pinned(client):
+    """The hard requirement: nothing is ever cut off — text wraps inside
+    the cell and the row grows. These assertions pin the configuration so
+    a future edit cannot silently reintroduce clipping."""
+    js = client.get("/dashboard/app.js").text
+    css = client.get("/dashboard/styles.css").text
+    html = client.get("/dashboard/").text
+
+    # Every column wraps and rows auto-size (defaultColDef):
+    assert "wrapText: true" in js
+    assert "autoHeight: true" in js
+    # Stable row identity -> in-place updates on every poll (no flicker,
+    # no scroll reset while the operator reads or aims at a button):
+    assert "getRowId" in js
+    # Cells keep newlines and break long tokens instead of clipping:
+    assert "pre-wrap" in css
+    assert "overflow-wrap: anywhere" in css
+    # Ellipsis is banned from the entire frontend:
+    assert "ellipsis" not in css
+    assert "ellipsis" not in js
+    assert "ellipsis" not in html
+    # The decision path targets the transactional admin endpoint:
+    assert "/v1/admin/approvals/" in js
+    assert "resume job #" in js  # feedback shows the enqueued resume job

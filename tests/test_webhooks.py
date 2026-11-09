@@ -371,3 +371,45 @@ def test_non_dispute_event_recorded_without_job(client, monkeypatch):
     assert r.json()["status"] == "accepted"
     assert r.json()["job_created"] is False
     assert _counts() == (1, 0)  # recorded for forensics, no agent dispatched
+
+
+# ---------------------------------------------------------------------------
+# Simulator: scripts/simulate_dispute.py must agree with the endpoint
+# ---------------------------------------------------------------------------
+
+def _load_simulator():
+    import importlib.util
+    from pathlib import Path
+
+    path = (Path(__file__).resolve().parent.parent
+            / "scripts" / "simulate_dispute.py")
+    spec = importlib.util.spec_from_file_location("simulate_dispute", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_simulator_payload_and_signature_accepted(client, monkeypatch):
+    """The simulator's payload builder and signer go through the SAME
+    endpoint path as a real delivery: build -> sign exact bytes -> accept."""
+    _enable_hmac(monkeypatch)
+    sim = _load_simulator()
+    payload = sim.build_payload(dispute_id="PP-D-42424",
+                                event_id="WH-SIM-TEST-1")
+    raw = json.dumps(payload).encode()
+
+    r = client.post(WEBHOOK_URL, content=raw, headers={
+        "Content-Type": "application/json",
+        "X-Tollgate-Signature": sim.sign(raw, SECRET)})
+
+    assert r.status_code == 200
+    assert r.json()["status"] == "accepted"
+    assert r.json()["job_created"] is True
+    with session_scope() as s:
+        row = s.execute(select(WebhookEvent)).scalar_one()
+        job = s.execute(select(WebhookOutbox)).scalar_one()
+    assert row.external_event_id == "WH-SIM-TEST-1"
+    assert row.payload["resource"]["disputed_transactions"][0][
+        "seller_transaction_id"] == "05Y454980K6595141"
+    assert job.dedup_key == "dispute:PP-D-42424"
+    assert job.payload["dispute_id"] == "PP-D-42424"

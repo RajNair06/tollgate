@@ -373,7 +373,14 @@ function initGrids() {
       getRowId: (params) => def.rowId(params.data),
       rowData: [],
       animateRows: false,
-      suppressCellFocus: true,
+      // Text must be selectable so operators can copy reasoning, stack
+      // traces, ids, JSON. enableCellTextSelection lifts AG Grid's
+      // default user-select:none on cells; ensureDomOrder keeps DOM
+      // order equal to visual order so drag-copies across cells/rows
+      // come out in reading order; cell focus is left enabled so a
+      // click can place the caret for keyboard-driven copying.
+      enableCellTextSelection: true,
+      ensureDomOrder: true,
       rowSelection: "single",
     });
   }

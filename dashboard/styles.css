@@ -160,6 +160,11 @@ body {
   padding-top: 6px !important;
   padding-bottom: 6px !important;
 }
+/* Copyable text: AG Grid ships user-select:none on cells. The grid
+   option enableCellTextSelection covers the grid chrome; this extends
+   selection to renderer-built content (JSON blocks, stack traces,
+   evidence items) so anything readable is also selectable. */
+.ag-cell, .ag-cell .pre, .ev-item { user-select: text; }
 .ag-cell .pre {
   white-space: pre-wrap;
   overflow-wrap: anywhere;

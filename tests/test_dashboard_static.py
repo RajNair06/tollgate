@@ -103,6 +103,13 @@ def test_no_truncation_contract_is_pinned(client):
     assert "ellipsis" not in css
     assert "ellipsis" not in js
     assert "ellipsis" not in html
+    # Cell text must stay selectable/copyable (reasoning, stack traces,
+    # ids, JSON) — AG Grid defaults to user-select:none, so the options
+    # that lift it are pinned here:
+    assert "enableCellTextSelection: true" in js
+    assert "ensureDomOrder: true" in js
+    assert "suppressCellFocus" not in js
+    assert "user-select: text" in css
     # The decision path targets the transactional admin endpoint:
     assert "/v1/admin/approvals/" in js
     assert "resume job #" in js  # feedback shows the enqueued resume job

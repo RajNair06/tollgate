@@ -2,9 +2,12 @@
 
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, Request
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
 from config import get_settings
 from gateway.admin import admin_router
@@ -77,6 +80,24 @@ def health(request: Request) -> dict:
         "version": app.version,
     }
 
+
+# Static admin dashboard (increment 9). Mounted BEFORE the MCP catch-all —
+# Starlette matches in registration order. html=True serves index.html at
+# /dashboard/; all assets (including vendored AG Grid) are local files, so
+# the page never reaches the network for anything but the JSON APIs.
+DASHBOARD_DIR = Path(__file__).resolve().parent / "dashboard"
+
+
+@app.get("/dashboard", include_in_schema=False)
+def dashboard_redirect():
+    # Without this, bare /dashboard fully matches the catch-all Mount("/")
+    # first and 404s inside the MCP sub-app — the Mount's own slash
+    # redirect never gets a turn. Route order beats mount order.
+    return RedirectResponse("/dashboard/")
+
+
+app.mount("/dashboard", StaticFiles(directory=str(DASHBOARD_DIR), html=True),
+          name="dashboard")
 
 # Mounted LAST — Starlette matches routes in registration order, so /health
 # and /v1/* keep priority and everything under /mcp falls through to the MCP

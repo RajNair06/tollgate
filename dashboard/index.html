@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Toll Gate — Admin Dashboard</title>
+  <!-- AG Grid Community v31.3.4 (MIT), vendored — the dashboard never
+       reaches the network for assets, fonts included (data-URIs). -->
+  <link rel="stylesheet" href="vendor/ag-grid.css">
+  <link rel="stylesheet" href="vendor/ag-theme-quartz.css">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header id="topbar">
+    <h1>Toll Gate <span class="subtitle">admin dashboard</span></h1>
+    <div id="conn">
+      <span id="conn-dot" class="dot" title="connection state"></span>
+      <span id="conn-text">connecting…</span>
+      <span id="last-update"></span>
+      <button id="key-btn" type="button">Admin key</button>
+    </div>
+  </header>
+
+  <div id="banner" hidden></div>
+
+  <section id="metrics" aria-label="Key metrics"><!-- cards rendered by app.js --></section>
+
+  <main id="panels">
+    <section class="panel" id="panel-approvals">
+      <h2>Pending approvals <span class="count"></span></h2>
+      <div class="grid ag-theme-quartz ag-theme-dark" id="grid-approvals"></div>
+    </section>
+    <section class="panel" id="panel-actions">
+      <h2>Actions <span class="count"></span></h2>
+      <div class="grid ag-theme-quartz ag-theme-dark" id="grid-actions"></div>
+    </section>
+    <section class="panel" id="panel-audit">
+      <h2>Audit log <span class="count"></span></h2>
+      <div class="grid ag-theme-quartz ag-theme-dark" id="grid-audit"></div>
+    </section>
+    <section class="panel" id="panel-dead">
+      <h2>Dead letter <span class="count"></span></h2>
+      <div class="grid ag-theme-quartz ag-theme-dark" id="grid-dead"></div>
+    </section>
+  </main>
+
+  <script src="vendor/ag-grid-community.min.noStyle.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

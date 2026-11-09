@@ -243,6 +243,10 @@ class AgentRunner:
             "usage": (values or {}).get("usage") or {},
             "confidence": decision.get("confidence"),
             "proposed_action": decision.get("proposed_action"),
+            # The FULL decision (reasoning + cited_evidence) lands in the
+            # record's detail JSON — the dashboard's approvals panel shows
+            # the human WHY the agent wants to refund, at pause time.
+            "decision": decision or None,
             "approval_id": payload.get("approval_id"),
         })
 

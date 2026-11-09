@@ -406,6 +406,15 @@ def test_pause_writes_provisional_run_row(runner_factory):
     assert rows[0][3] == 77  # the resume lookup key
     # Found by approval id:
     assert runner.run_log.find_by_approval(77)["run_id"] == "webhook-PP-D-77011"
+    # The FULL decision (reasoning + cited evidence) is preserved in the
+    # record's detail JSON — the dashboard's approvals panel shows the
+    # human WHY the agent wants to refund while the run is still paused.
+    with psycopg.connect(AGENT_TEST_DB, autocommit=True) as conn:
+        detail = conn.execute(
+            "SELECT detail FROM agent_runs WHERE run_id = 'webhook-PP-D-77011'"
+        ).fetchone()[0]
+    assert detail["decision"]["reasoning"]
+    assert detail["decision"]["cited_evidence"]
 
 
 def test_resume_approved_executes_refund(runner_factory, make_agent):

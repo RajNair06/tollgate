@@ -41,6 +41,11 @@ class Settings:
     #   parsing, and persistence path — only the crypto check differs.
     paypal_webhook_id: str
     webhook_shared_secret: str
+    # The agent's telemetry database (agent_runs). The dashboard endpoints
+    # READ it to show run reasoning/confidence next to pending approvals —
+    # a cross-database join done in Python, because the gateway schema must
+    # not grow foreign keys into a database another process owns.
+    agent_database_url: str
 
 
 def get_settings() -> Settings:
@@ -73,4 +78,8 @@ def get_settings() -> Settings:
         admin_api_key=os.environ.get("ADMIN_API_KEY", "").strip(),
         paypal_webhook_id=os.environ.get("PAYPAL_WEBHOOK_ID", "").strip(),
         webhook_shared_secret=os.environ.get("WEBHOOK_SHARED_SECRET", "").strip(),
+        agent_database_url=os.environ.get(
+            "AGENT_DATABASE_URL",
+            "postgresql://tollgate:tollgate@localhost:5433/agent",
+        ).strip(),
     )

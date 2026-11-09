@@ -39,6 +39,7 @@ from agent.testing import (
     ScriptedLLM,
     decision_json,
     envelope_dispute,
+    envelope_execute_approved,
     envelope_refund_executed,
     envelope_refund_pending,
     envelope_transaction,
@@ -112,14 +113,20 @@ def _agent_settings() -> AgentSettings:
     )
 
 
-def _scripted_builder(script, responses):
-    """graph_builder for AgentRunner: the REAL compiled graph over fakes."""
-    def builder(run_id: str, runner: AgentRunner):
+def _scripted_builder(script, responses, registry=None):
+    """graph_builder for AgentRunner: the REAL compiled graph over fakes.
+    A shared registry (instead of per-build responses) lets resume tests
+    inspect the FULL call history across the pause and the resume."""
+    def builder(run_id: str, runner: AgentRunner, prior_usage=None):
         meter = RunMeter(model="scripted", budget_tokens=100_000)
         meter.run_id = run_id
+        if prior_usage:
+            meter.usage.input_tokens = prior_usage.get("input_tokens", 0)
+            meter.usage.output_tokens = prior_usage.get("output_tokens", 0)
+            meter.llm_calls = prior_usage.get("llm_calls", 0)
         llm = ScriptedLLM(script, meter=meter)
-        registry = FakeRegistry(dict(responses))
-        return build_graph(llm, registry, prompt_version="v1",
+        reg = registry if registry is not None else FakeRegistry(dict(responses))
+        return build_graph(llm, reg, prompt_version="v1",
                            checkpointer=runner.saver,
                            run_log=runner.run_log.write,
                            min_confidence=0.6)
@@ -131,9 +138,10 @@ def runner_factory():
     """Build AgentRunners against agent_test, closing them after the test."""
     made: list[AgentRunner] = []
 
-    def _make(script, responses):
+    def _make(script, responses, registry=None):
         r = AgentRunner(_agent_settings(),
-                        graph_builder=_scripted_builder(script, responses))
+                        graph_builder=_scripted_builder(script, responses,
+                                                        registry))
         made.append(r)
         return r
 
@@ -170,7 +178,8 @@ def _latest_run_audit() -> AuditLog | None:
 def _agent_run_rows(run_id: str) -> list[tuple]:
     with psycopg.connect(AGENT_TEST_DB, autocommit=True) as conn:
         return conn.execute(
-            "SELECT run_id, dispute_id, status FROM agent_runs WHERE run_id = %s",
+            "SELECT run_id, dispute_id, status, approval_id "
+            "FROM agent_runs WHERE run_id = %s",
             (run_id,)).fetchall()
 
 
@@ -220,8 +229,8 @@ def test_classify_run_matrix(status, text, expected):
 def test_unknown_job_type_is_permanent():
     called = []
     d = Dispatcher(lambda dispute_id: called.append(dispute_id) or {})
-    with pytest.raises(PermanentJobError, match="UNKNOWN_JOB_TYPE"):
-        d("resume_agent", {})  # wired in a later increment; must not vanish silently
+    with pytest.raises(PermanentJobError, match="RESUME_NOT_CONFIGURED"):
+        d("resume_agent", {})  # this dispatcher has no resume handler wired
     with pytest.raises(PermanentJobError, match="UNKNOWN_JOB_TYPE"):
         d("frobnicate", {})
     assert called == []
@@ -355,6 +364,152 @@ def test_redispatch_of_paused_dispute_reports_pending_again(runner_factory):
     assert outcome2["already_completed"] is True
     assert outcome2["status"] == "pending_approval"
     assert outcome2["interrupt"]["approval_id"] == 43  # pause undisturbed
+
+
+# ---------------------------------------------------------------------------
+# Resume pipeline: approval decision -> resume_agent job -> money moves once
+# ---------------------------------------------------------------------------
+
+def _pause_world(dispute_id: str, approval_id: int):
+    return _happy_world(dispute_id, refund_envelope=envelope_refund_pending(
+        approval_id=approval_id, action_id=600 + approval_id))
+
+
+def _enqueue_resume(approval_id: int, approved: bool,
+                    decided_by: str = "admin-test") -> int:
+    with session_scope() as s:
+        job_id = enqueue_job(s, "resume_agent",
+                             {"approval_id": approval_id,
+                              "approved": approved,
+                              "decided_by": decided_by})
+    assert job_id is not None
+    return job_id
+
+
+def _resume_dispatcher(runner, api_key) -> Dispatcher:
+    return Dispatcher(runner.run_dispute, resume=runner.resume_approval,
+                      audit=GatewayAudit(get_engine(), api_key))
+
+
+def test_pause_writes_provisional_run_row(runner_factory):
+    """finalize() never runs at an interrupt — the pause itself must write
+    the agent_runs row (with approval_id), or resume lookup is blind."""
+    script, responses = _pause_world("PP-D-77011", approval_id=77)
+    runner = runner_factory(script, responses)
+
+    outcome = runner.run_dispute("PP-D-77011")
+
+    assert outcome["status"] == "pending_approval"
+    rows = _agent_run_rows("webhook-PP-D-77011")
+    assert len(rows) == 1
+    assert rows[0][2] == "pending_approval"
+    assert rows[0][3] == 77  # the resume lookup key
+    # Found by approval id:
+    assert runner.run_log.find_by_approval(77)["run_id"] == "webhook-PP-D-77011"
+
+
+def test_resume_approved_executes_refund(runner_factory, make_agent):
+    _, api_key = make_agent()
+    script, responses = _pause_world("PP-D-77012", approval_id=78)
+    responses = {**responses,
+                 "execute_approved_refund": envelope_execute_approved()}
+    registry = FakeRegistry(responses)  # shared across pause + resume builds
+    runner = runner_factory(script, responses, registry=registry)
+    assert runner.run_dispute("PP-D-77012")["status"] == "pending_approval"
+
+    job_id = _enqueue_resume(78, approved=True)
+    Worker(get_engine(), _resume_dispatcher(runner, api_key), FAST).run_once()
+
+    assert _job(job_id).status == "processed"
+    # The money moved through the gateway tool, once, for the right approval.
+    assert ("execute_approved_refund", {"approval_id": 78}) in registry.calls
+    rows = _agent_run_rows("webhook-PP-D-77012")
+    assert len(rows) == 1  # upsert, not a second row
+    assert rows[0][2] == "refund_executed_after_approval"
+    assert rows[0][3] == 78  # COALESCE kept the link through finalize
+    audit = _latest_run_audit()
+    assert audit.reason_code == "refund_executed_after_approval"
+    assert audit.detail["dispute_id"] == "PP-D-77012"
+
+
+def test_resume_rejected_moves_no_money(runner_factory, make_agent):
+    _, api_key = make_agent()
+    script, responses = _pause_world("PP-D-77013", approval_id=79)
+    registry = FakeRegistry(responses)
+    runner = runner_factory(script, responses, registry=registry)
+    runner.run_dispute("PP-D-77013")
+
+    job_id = _enqueue_resume(79, approved=False)
+    Worker(get_engine(), _resume_dispatcher(runner, api_key), FAST).run_once()
+
+    assert _job(job_id).status == "processed"  # a rejection is a verdict
+    assert "execute_approved_refund" not in registry.names_called()
+    rows = _agent_run_rows("webhook-PP-D-77013")
+    assert rows[0][2] == "refund_not_approved"
+    assert _latest_run_audit().reason_code == "refund_not_approved"
+
+
+def test_resume_unknown_approval_dead_letters(runner_factory, make_agent):
+    _, api_key = make_agent()
+    runner = runner_factory([], {})
+    job_id = _enqueue_resume(987654321, approved=True)
+
+    Worker(get_engine(), _resume_dispatcher(runner, api_key), FAST).run_once()
+
+    row = _job(job_id)
+    assert row.status == "dead"
+    assert "NO_RUN_FOR_APPROVAL" in row.last_error
+
+
+def test_resume_redelivery_moves_money_once(runner_factory, make_agent):
+    """A reclaimed lease / duplicate enqueue delivers the same resume again.
+    The checkpoint pre-check makes the second delivery a recorded no-op."""
+    _, api_key = make_agent()
+    script, responses = _pause_world("PP-D-77014", approval_id=80)
+    responses = {**responses,
+                 "execute_approved_refund": envelope_execute_approved()}
+    registry = FakeRegistry(responses)
+    runner = runner_factory(script, responses, registry=registry)
+    runner.run_dispute("PP-D-77014")
+
+    worker = Worker(get_engine(), _resume_dispatcher(runner, api_key), FAST)
+    _enqueue_resume(80, approved=True)
+    worker.run_once()
+    _enqueue_resume(80, approved=True)  # redelivery of the same decision
+    worker.run_once()
+
+    executions = [c for c in registry.calls
+                  if c[0] == "execute_approved_refund"]
+    assert len(executions) == 1  # money moved exactly once
+    assert _agent_run_rows("webhook-PP-D-77014")[0][2] == \
+        "refund_executed_after_approval"
+
+
+def test_resume_wrong_approval_id_is_permanent(runner_factory):
+    """The run is paused for approval 81; a resume claiming 82 must not
+    move money on it — even though a run row was doctored to point there."""
+    script, responses = _pause_world("PP-D-77015", approval_id=81)
+    runner = runner_factory(script, responses)
+    runner.run_dispute("PP-D-77015")
+    with psycopg.connect(AGENT_TEST_DB, autocommit=True) as conn:
+        conn.execute("UPDATE agent_runs SET approval_id = 82 "
+                     "WHERE run_id = 'webhook-PP-D-77015'")
+
+    with pytest.raises(PermanentJobError, match="APPROVAL_MISMATCH"):
+        runner.resume_approval(82, approved=True, decided_by="typo-operator")
+
+
+@pytest.mark.parametrize("payload", [
+    {"approved": True},                      # missing approval_id
+    {"approval_id": "x", "approved": True},  # wrong type
+    {"approval_id": True, "approved": True},  # bool is not an id
+    {"approval_id": 5},                      # missing decision
+    {"approval_id": 5, "approved": "yes"},   # wrong type
+])
+def test_resume_payload_validation_is_permanent(payload):
+    d = Dispatcher(lambda dispute_id: {}, resume=lambda *a: {})
+    with pytest.raises(PermanentJobError, match="MALFORMED_PAYLOAD"):
+        d("resume_agent", payload)
 
 
 # ---------------------------------------------------------------------------

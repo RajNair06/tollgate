@@ -38,6 +38,7 @@ _PROCESSED_STATUSES = frozenset({
     "schema_failed",        # model output broke the schema — terminal by design
     "budget_exceeded",      # retrying with the same budget cannot help
     "pending_approval",     # paused at the interrupt; humans take it from here
+    "refund_not_approved",  # human said no on resume; no money moved, verdict recorded
 })
 
 # Failure statuses whose error TEXT decides retryability.
@@ -125,19 +126,28 @@ class GatewayAudit:
 class Dispatcher:
     """The worker's handler. job_type -> action:
     - dispute_agent: run the dispute agent for payload['dispute_id'].
+    - resume_agent: resume the run paused at payload['approval_id'] with
+      the human's decision (payload['approved']).
     - anything else: PermanentJobError (dead-letters visibly instead of
       silently piling up).
     """
 
     def __init__(self, run_dispute: Callable[[str], dict],
+                 resume: Callable[[int, bool, str], dict] | None = None,
                  audit: Callable[[dict], None] | None = None):
         self._run_dispute = run_dispute
+        self._resume = resume
         self._audit = audit or (lambda outcome: None)
 
     def __call__(self, job_type: str, payload: dict) -> None:
-        if job_type != "dispute_agent":
-            raise PermanentJobError(f"UNKNOWN_JOB_TYPE: {job_type!r}")
-        self._handle_dispute(payload or {})
+        if job_type == "dispute_agent":
+            return self._handle_dispute(payload or {})
+        if job_type == "resume_agent":
+            if self._resume is None:
+                raise PermanentJobError(
+                    "RESUME_NOT_CONFIGURED: worker has no resume handler")
+            return self._handle_resume(payload or {})
+        raise PermanentJobError(f"UNKNOWN_JOB_TYPE: {job_type!r}")
 
     def _handle_dispute(self, payload: dict) -> None:
         dispute_id = payload.get("dispute_id")
@@ -146,8 +156,37 @@ class Dispatcher:
                 f"MALFORMED_PAYLOAD: missing dispute_id in {str(payload)[:200]}")
 
         outcome = self._run_dispute(dispute_id)  # may raise: worker classifies
-        self._audit(outcome)  # audit BEFORE finalizing; a failure here retries the job
+        self._settle(outcome)
+        logger.info("Dispute %s: run %s finished with %s",
+                    dispute_id, outcome.get("run_id"),
+                    outcome.get("status"))
 
+    def _handle_resume(self, payload: dict) -> None:
+        approval_id = payload.get("approval_id")
+        approved = payload.get("approved")
+        # bool is an int subclass — reject True/False masquerading as an id.
+        if not isinstance(approval_id, int) or isinstance(approval_id, bool):
+            raise PermanentJobError(
+                f"MALFORMED_PAYLOAD: resume job needs an integer "
+                f"approval_id, got {approval_id!r}")
+        if not isinstance(approved, bool):
+            raise PermanentJobError(
+                f"MALFORMED_PAYLOAD: resume job needs a boolean 'approved', "
+                f"got {approved!r}")
+        decided_by = str(payload.get("decided_by") or "unknown")
+
+        outcome = self._resume(approval_id, approved, decided_by)
+        self._settle(outcome)
+        logger.info("Approval %d (%s): run %s finished with %s",
+                    approval_id, "approved" if approved else "rejected",
+                    outcome.get("run_id"), outcome.get("status"))
+
+    def _settle(self, outcome: dict) -> None:
+        """Audit the outcome BEFORE finalizing, then translate the run's
+        terminal status into the job's fate. An audit-write failure
+        propagates: the job retries, the runner's pre-checks make the
+        re-run cheap, and the audit row lands on the next attempt."""
+        self._audit(outcome)
         status = outcome.get("status", "unknown")
         verdict = classify_run(status, outcome.get("summary") or "")
         if verdict == "retryable":
@@ -156,5 +195,3 @@ class Dispatcher:
         if verdict == "permanent":
             raise PermanentJobError(
                 f"{status}: {(outcome.get('summary') or '')[:_MAX_MESSAGE]}")
-        logger.info("Dispute %s: run %s finished with %s",
-                    dispute_id, outcome.get("run_id"), status)

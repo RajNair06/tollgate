@@ -36,6 +36,12 @@ agent_runs = Table(
     # labels these will eventually be plotted against.
     Column("confidence", Float, nullable=True),
     Column("proposed_action", String(32), nullable=True),
+    # Human-approval link: written when a run PAUSES at the approval
+    # interrupt (the provisional row) and PRESERVED by the finalize upsert
+    # via COALESCE. This is the join key between the gateway's approvals
+    # table and the agent's run history (cross-database: the dashboard
+    # reads both), and the lookup path for resume_agent jobs.
+    Column("approval_id", BigInteger, nullable=True),
     Column("detail", JSON, nullable=False, default=dict),
     Column("created_at", DateTime(timezone=True), nullable=False,
            default=lambda: datetime.now(timezone.utc)),
@@ -47,11 +53,11 @@ _UPSERT = text("""
 INSERT INTO agent_runs
     (run_id, dispute_id, status, summary, input_tokens, output_tokens,
      total_tokens, cost_usd, llm_calls, confidence, proposed_action,
-     detail, created_at, updated_at)
+     approval_id, detail, created_at, updated_at)
 VALUES
     (:run_id, :dispute_id, :status, :summary, :input_tokens, :output_tokens,
      :total_tokens, :cost_usd, :llm_calls, :confidence, :proposed_action,
-     CAST(:detail AS JSON), now(), now())
+     :approval_id, CAST(:detail AS JSON), now(), now())
 ON CONFLICT (run_id) DO UPDATE SET
     status = EXCLUDED.status,
     summary = EXCLUDED.summary,
@@ -62,6 +68,9 @@ ON CONFLICT (run_id) DO UPDATE SET
     llm_calls = EXCLUDED.llm_calls,
     confidence = EXCLUDED.confidence,
     proposed_action = EXCLUDED.proposed_action,
+    -- finalize records carry no approval_id; the pause-time link must
+    -- survive every later upsert of the same run.
+    approval_id = COALESCE(EXCLUDED.approval_id, agent_runs.approval_id),
     detail = EXCLUDED.detail,
     updated_at = now()
 """)
@@ -84,6 +93,10 @@ class RunLog:
                               "confidence DOUBLE PRECISION"))
             conn.execute(text("ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS "
                               "proposed_action VARCHAR(32)"))
+            conn.execute(text("ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS "
+                              "approval_id BIGINT"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_agent_runs_approval "
+                              "ON agent_runs (approval_id)"))
 
     def write(self, record: dict) -> None:
         usage = record.get("usage") or {}
@@ -100,8 +113,21 @@ class RunLog:
                 "llm_calls": usage.get("llm_calls", 0),
                 "confidence": record.get("confidence"),
                 "proposed_action": record.get("proposed_action"),
+                "approval_id": record.get("approval_id"),
                 "detail": json.dumps(record, default=str),
             })
+
+    def find_by_approval(self, approval_id: int) -> dict | None:
+        """The run currently linked to a gateway approval id (or None).
+        This is how a resume_agent job — which knows only the approval —
+        finds the paused run's thread."""
+        with self._engine.begin() as conn:
+            row = conn.execute(text(
+                "SELECT run_id, dispute_id, status FROM agent_runs "
+                "WHERE approval_id = :aid "
+                "ORDER BY updated_at DESC LIMIT 1"), {"aid": approval_id},
+            ).fetchone()
+        return dict(row._mapping) if row is not None else None
 
     def dispose(self) -> None:
         self._engine.dispose()

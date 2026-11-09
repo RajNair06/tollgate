@@ -46,7 +46,10 @@ def main() -> int:
     engine = create_engine(worker_settings.database_url, pool_size=2,
                            max_overflow=3, pool_pre_ping=True)
     audit = GatewayAudit(engine, agent_settings.gateway_api_key)
-    worker = Worker(engine, Dispatcher(runner.run_dispute, audit=audit),
+    worker = Worker(engine,
+                    Dispatcher(runner.run_dispute,
+                               resume=runner.resume_approval,
+                               audit=audit),
                     worker_settings)
 
     stop = threading.Event()

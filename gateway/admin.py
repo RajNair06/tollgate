@@ -43,12 +43,19 @@ from sqlalchemy.orm import Session
 
 from config import get_settings
 from gateway import audit
+from gateway import approvals as approvals_mod
 from gateway.api_keys import generate_api_key
 from gateway.auth import get_db
 from gateway.models import Agent, AgentKey, Policy
+# Dependency direction note: gateway -> worker.queue -> gateway.models.
+# enqueue_job writes a gateway table (webhook_outbox); it lives in the
+# worker package next to its claim/finalize counterparts, and importing it
+# here creates no cycle (worker.queue never imports gateway.admin).
+from worker.queue import enqueue_job
 from gateway.schemas import (
     AgentAdminView,
     AgentKeyView,
+    ApprovalDecisionRequest,
     CreateAgentRequest,
     CreateAgentResponse,
     IssueKeyResponse,
@@ -334,3 +341,58 @@ def get_agent(
         raise HTTPException(status_code=404, detail={"reason_code": "AGENT_NOT_FOUND"})
     _ = agent.policy, agent.keys
     return _agent_view(agent)
+
+
+@admin_router.post("/approvals/{approval_id}/decision")
+def decide_approval(
+    approval_id: int,
+    body: ApprovalDecisionRequest,
+    _: None = Depends(require_admin),
+    session: Session = Depends(get_db),
+):
+    """The HUMAN decision path (dashboard): pending → approved | rejected.
+
+    Same state machine as the agent-authenticated /v1/approvals/{id}/decision
+    — approvals.decide() under a row lock, with the audit + event + outbox
+    rows it always writes — plus the webhook-pipeline step that makes the
+    paused agent wake up: a resume_agent job is enqueued into webhook_outbox
+    in the SAME transaction. Commit-before-you-speak: either the decision
+    AND the resume job land together, or neither does. A decision can never
+    be recorded without the agent being (eventually) resumed, and a resume
+    job can never exist for a decision that was rolled back.
+
+    The dedup key resume:{approval_id} makes double-enqueue impossible at
+    the database level — though the transition guard already rejects a
+    second decision on the same approval (409) before it could happen.
+    """
+    try:
+        approval = approvals_mod.decide(
+            session, approval_id, body.decision, body.decided_by)
+    except approvals_mod.ApprovalNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"reason_code": "APPROVAL_NOT_FOUND"}) from exc
+    except approvals_mod.InvalidTransitionError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"reason_code": "INVALID_TRANSITION", "detail": str(exc)},
+        ) from exc
+
+    job_id = enqueue_job(
+        session, "resume_agent",
+        {"approval_id": approval_id,
+         "approved": body.decision == "approved",
+         "decided_by": body.decided_by},
+        dedup_key=f"resume:{approval_id}",
+    )
+    session.commit()  # commit before you speak
+    logger.info("Admin decision on approval %s: %s (resume job %s)",
+                approval_id, body.decision, job_id)
+    return {
+        "approval_id": approval_id,
+        "status": approval.status,
+        "reason_code": approval.reason_code,
+        "decided_at": approval.decided_at.isoformat() if approval.decided_at else None,
+        "decided_by": approval.decided_by,
+        "resume_job_id": job_id,
+    }

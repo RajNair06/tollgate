@@ -65,6 +65,9 @@ AUDIT_DECISIONS = APPROVAL_STATUSES + ACTION_OUTCOMES + (
     "key_issued",
     "key_revoked",
     "agent_updated",
+    # Webhook pipeline: the worker's record of a dispatched agent run's
+    # terminal outcome (migration f6a7b8c9d0e1 widened the CHECK for this).
+    "agent_run_finished",
 )
 
 # Webhook pipeline vocabularies (migration e5f6a7b8c9d0).

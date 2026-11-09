@@ -1,0 +1,417 @@
+"""Worker dispatch tests: webhook job -> LangGraph run -> audit row.
+
+The REAL compiled graph runs against the REAL agent_test PostgreSQL
+(checkpoints + agent_runs) with ScriptedLLM/FakeRegistry from agent.testing
+— the same topology as tests/test_agent_graph.py. Gateway-side rows
+(webhook_outbox, audit_log) live in the conftest test database.
+
+Proven here:
+- the outcome classification matrix (processed / retryable / permanent)
+- happy-path dispatch: job processed, agent_runs row, 'agent_run_finished'
+  audit row attributed to the right agent
+- approval interrupt: job processed as pending_approval with approval_id
+- definite evidence failure (RESOURCE_NOT_FOUND): dead-lettered
+- transient evidence failure (GATEWAY_UNREACHABLE): rescheduled
+- the duplicate-run guard: a re-dispatched dispute is NOT re-run — the
+  checkpoint pre-check returns the recorded outcome
+- end to end: signed webhook POST -> outbox row -> worker -> run -> audit
+"""
+
+import importlib.util
+import json
+from pathlib import Path
+
+import psycopg
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import select
+
+from agent.budget import RunMeter
+from agent.checkpoint import ensure_database, open_checkpointer
+from agent.config import AgentSettings
+from agent.graph import build_graph
+from agent.runs import RunLog
+from agent.testing import (
+    CLEAN_DRAFT,
+    CRITIC_OK,
+    DISPUTE,
+    FakeRegistry,
+    ScriptedLLM,
+    decision_json,
+    envelope_dispute,
+    envelope_refund_executed,
+    envelope_refund_pending,
+    envelope_transaction,
+)
+from gateway.db import get_engine, session_scope
+from gateway.models import AuditLog, WebhookOutbox
+from worker.agent_runner import AgentRunner, run_id_for
+from worker.config import WorkerSettings
+from worker.dispatch import Dispatcher, GatewayAudit, classify_run
+from worker.errors import PermanentJobError, RetryableJobError
+from worker.queue import enqueue_job
+from worker.worker import Worker
+
+AGENT_TEST_DB = "postgresql://tollgate:tollgate@localhost:5433/agent_test"
+
+
+@pytest.fixture(autouse=True)
+def _clean_agent_state():
+    """agent_test PERSISTS across pytest runs, and webhook run ids are
+    DETERMINISTIC (webhook-<dispute_id>) — without this, a checkpoint left
+    by a previous run would make the pre-check skip the run under test.
+    Tolerant of fresh databases where the tables don't exist yet."""
+    ensure_database(AGENT_TEST_DB)
+    with psycopg.connect(AGENT_TEST_DB, autocommit=True) as conn:
+        def _exists(table: str) -> bool:
+            return conn.execute(
+                "SELECT to_regclass(%s) IS NOT NULL", (table,)).fetchone()[0]
+        if _exists("agent_runs"):
+            conn.execute("DELETE FROM agent_runs WHERE run_id LIKE 'webhook-%'")
+        for table in ("checkpoint_writes", "checkpoint_blobs", "checkpoints"):
+            if _exists(table):
+                conn.execute(
+                    f"DELETE FROM {table} WHERE thread_id LIKE 'webhook-%'")
+    yield
+
+FAST = WorkerSettings(
+    database_url="",  # unused: tests inject the conftest engine
+    max_attempts=3,
+    backoff_base_seconds=0.02,
+    backoff_max_seconds=0.1,
+    lease_seconds=300.0,
+    poll_interval_seconds=0.01,
+    batch_size=5,
+)
+
+def _happy_world(dispute_id: str, refund_envelope=None):
+    """A self-consistent scripted world: the evidence, the decision JSON,
+    and the state all agree on the dispute id (RefundDecision's cross-field
+    validator rejects mismatches — schema_failed)."""
+    dispute = dict(DISPUTE)
+    dispute["dispute_id"] = dispute_id
+    responses = {
+        "get_dispute": envelope_dispute(dispute),
+        "get_transaction": envelope_transaction(),
+        "issue_refund": refund_envelope or envelope_refund_executed(),
+    }
+    script = [CLEAN_DRAFT, CRITIC_OK, decision_json(dispute_id=dispute_id)]
+    return script, responses
+
+
+def _agent_settings() -> AgentSettings:
+    return AgentSettings(
+        mcp_url="http://unused.invalid/mcp",
+        gateway_api_key="tg_test_unused",
+        gemini_api_key="dummy",
+        model="scripted",
+        token_budget=100_000,
+        database_url=AGENT_TEST_DB,
+        prompt_version="v1",
+        min_confidence=0.6,
+    )
+
+
+def _scripted_builder(script, responses):
+    """graph_builder for AgentRunner: the REAL compiled graph over fakes."""
+    def builder(run_id: str, runner: AgentRunner):
+        meter = RunMeter(model="scripted", budget_tokens=100_000)
+        meter.run_id = run_id
+        llm = ScriptedLLM(script, meter=meter)
+        registry = FakeRegistry(dict(responses))
+        return build_graph(llm, registry, prompt_version="v1",
+                           checkpointer=runner.saver,
+                           run_log=runner.run_log.write,
+                           min_confidence=0.6)
+    return builder
+
+
+@pytest.fixture()
+def runner_factory():
+    """Build AgentRunners against agent_test, closing them after the test."""
+    made: list[AgentRunner] = []
+
+    def _make(script, responses):
+        r = AgentRunner(_agent_settings(),
+                        graph_builder=_scripted_builder(script, responses))
+        made.append(r)
+        return r
+
+    yield _make
+    for r in made:
+        r.close()
+
+
+def _enqueue_dispute(dispute_id: str) -> int:
+    with session_scope() as s:
+        job_id = enqueue_job(s, "dispute_agent",
+                             {"dispute_id": dispute_id,
+                              "external_event_id": f"WH-{dispute_id}"},
+                             f"dispute:{dispute_id}")
+    assert job_id is not None
+    return job_id
+
+
+def _job(job_id: int) -> WebhookOutbox:
+    with session_scope() as s:
+        return s.execute(select(WebhookOutbox).where(
+            WebhookOutbox.id == job_id)).scalar_one()
+
+
+def _latest_run_audit() -> AuditLog | None:
+    with session_scope() as s:
+        return s.execute(
+            select(AuditLog)
+            .where(AuditLog.decision == "agent_run_finished")
+            .order_by(AuditLog.id.desc()).limit(1)
+        ).scalar_one_or_none()
+
+
+def _agent_run_rows(run_id: str) -> list[tuple]:
+    with psycopg.connect(AGENT_TEST_DB, autocommit=True) as conn:
+        return conn.execute(
+            "SELECT run_id, dispute_id, status FROM agent_runs WHERE run_id = %s",
+            (run_id,)).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Classification matrix (pure function)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("status,text,expected", [
+    # Recorded verdicts -> processed
+    ("refund_executed", "", "processed"),
+    ("refund_executed_after_approval", "", "processed"),
+    ("refund_denied_by_policy", "", "processed"),
+    ("refund_deduplicated", "", "processed"),
+    ("decision_deny_refund", "", "processed"),
+    ("decision_escalate_human", "", "processed"),
+    ("rejected_by_critic", "", "processed"),
+    ("completed_no_action", "", "processed"),
+    ("schema_failed", "", "processed"),
+    ("budget_exceeded", "", "processed"),
+    ("pending_approval", "", "processed"),
+    ("some_future_status", "", "processed"),  # unknown vocabulary never loops
+    # LLM/provider failures -> retryable
+    ("llm_error", "llm_error: 503 model saturated", "retryable"),
+    # Ambiguous statuses: the error text decides
+    ("evidence_failed", "get_dispute: RESOURCE_NOT_FOUND: no such dispute",
+     "permanent"),
+    ("evidence_failed", "get_dispute: GATEWAY_UNREACHABLE: connection refused",
+     "retryable"),
+    ("evidence_failed", "get_dispute: RATE_LIMITED: slow down", "retryable"),
+    ("evidence_failed", "dispute PP-D-1 references no retrievable transaction",
+     "permanent"),
+    ("refund_request_failed", "PayPalServerError: [503] outage", "retryable"),
+    ("refund_request_failed", "NOT_ALLOWED: action not in allowlist",
+     "permanent"),
+    ("refund_execution_failed", "request timed out", "retryable"),
+    ("refund_execution_failed", "INVALID_ARGUMENT: bad capture id",
+     "permanent"),
+])
+def test_classify_run_matrix(status, text, expected):
+    assert classify_run(status, text) == expected
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher guards
+# ---------------------------------------------------------------------------
+
+def test_unknown_job_type_is_permanent():
+    called = []
+    d = Dispatcher(lambda dispute_id: called.append(dispute_id) or {})
+    with pytest.raises(PermanentJobError, match="UNKNOWN_JOB_TYPE"):
+        d("resume_agent", {})  # wired in a later increment; must not vanish silently
+    with pytest.raises(PermanentJobError, match="UNKNOWN_JOB_TYPE"):
+        d("frobnicate", {})
+    assert called == []
+
+
+def test_missing_dispute_id_is_permanent():
+    d = Dispatcher(lambda dispute_id: {})
+    with pytest.raises(PermanentJobError, match="MALFORMED_PAYLOAD"):
+        d("dispute_agent", {"nope": 1})
+
+
+# ---------------------------------------------------------------------------
+# Dispatch through the worker
+# ---------------------------------------------------------------------------
+
+def test_happy_path_processes_run_and_audits(runner_factory, make_agent,
+                                             monkeypatch):
+    agent_id, api_key = make_agent()
+    monkeypatch.setenv("AGENT_API_KEY", api_key)
+    script, responses = _happy_world("PP-D-77001")
+    runner = runner_factory(script, responses)
+    dispatcher = Dispatcher(runner.run_dispute,
+                            audit=GatewayAudit(get_engine(), api_key))
+    job_id = _enqueue_dispute("PP-D-77001")
+
+    assert Worker(get_engine(), dispatcher, FAST).run_once() == 1
+
+    row = _job(job_id)
+    assert row.status == "processed"
+    assert row.processed_at is not None
+
+    # The run reached the agent's own database under the deterministic id.
+    run_id = run_id_for("PP-D-77001")
+    assert run_id == "webhook-PP-D-77001"
+    rows = _agent_run_rows(run_id)
+    assert len(rows) == 1
+    assert rows[0][2] == "refund_executed"
+
+    # The final outcome is in the gateway's audit_log, attributed correctly.
+    audit = _latest_run_audit()
+    assert audit is not None
+    assert audit.reason_code == "refund_executed"
+    assert audit.agent_id == agent_id
+    assert audit.detail["run_id"] == run_id
+    assert audit.detail["dispute_id"] == "PP-D-77001"
+
+
+def test_approval_interrupt_processed_as_pending_approval(runner_factory,
+                                                          make_agent):
+    _, api_key = make_agent()
+    script, responses = _happy_world(
+        "PP-D-77002",
+        refund_envelope=envelope_refund_pending(approval_id=42, action_id=680))
+    runner = runner_factory(script, responses)
+    dispatcher = Dispatcher(runner.run_dispute,
+                            audit=GatewayAudit(get_engine(), api_key))
+    job_id = _enqueue_dispute("PP-D-77002")
+
+    Worker(get_engine(), dispatcher, FAST).run_once()
+
+    assert _job(job_id).status == "processed"  # the pause is not a failure
+    audit = _latest_run_audit()
+    assert audit.reason_code == "pending_approval"
+    assert audit.detail["approval_id"] == 42
+
+
+def test_definite_evidence_failure_dead_letters(runner_factory, make_agent):
+    _, api_key = make_agent()
+    responses = {"get_dispute": {
+        "ok": False, "summary": "RESOURCE_NOT_FOUND: dispute does not exist"}}
+    runner = runner_factory([], responses)  # no LLM call should ever happen
+    dispatcher = Dispatcher(runner.run_dispute,
+                            audit=GatewayAudit(get_engine(), api_key))
+    job_id = _enqueue_dispute("PP-D-77003")
+
+    Worker(get_engine(), dispatcher, FAST).run_once()
+
+    row = _job(job_id)
+    assert row.status == "dead"
+    assert row.attempts == 1
+    assert row.failed_at is not None
+    assert "RESOURCE_NOT_FOUND" in row.last_error
+    # Even the failure outcome is audited.
+    assert _latest_run_audit().reason_code == "evidence_failed"
+
+
+def test_transient_evidence_failure_reschedules(runner_factory, make_agent):
+    _, api_key = make_agent()
+    responses = {"get_dispute": {
+        "ok": False, "summary": "GATEWAY_UNREACHABLE: connection refused"}}
+    runner = runner_factory([], responses)
+    dispatcher = Dispatcher(runner.run_dispute,
+                            audit=GatewayAudit(get_engine(), api_key))
+    job_id = _enqueue_dispute("PP-D-77004")
+
+    Worker(get_engine(), dispatcher, FAST).run_once()
+
+    row = _job(job_id)
+    assert row.status == "pending"  # retried later, not dead
+    assert row.attempts == 1
+    assert "GATEWAY_UNREACHABLE" in row.last_error
+
+
+def test_redispatch_of_finished_dispute_is_not_rerun(runner_factory):
+    """The duplicate-run guard: at-least-once dispatch + checkpoint
+    pre-check = one RUN per dispute. The second runner has an EMPTY LLM
+    script — if the graph re-ran, ScriptedLLM would raise."""
+    first = runner_factory(*_happy_world("PP-D-77005"))
+    outcome1 = first.run_dispute("PP-D-77005")
+    assert outcome1["status"] == "refund_executed"
+    assert outcome1["run_id"] == "webhook-PP-D-77005"
+
+    second = runner_factory([], {})  # any LLM/tool call would blow up
+    outcome2 = second.run_dispute("PP-D-77005")
+
+    assert outcome2["already_completed"] is True
+    assert outcome2["status"] == "refund_executed"
+    assert len(_agent_run_rows("webhook-PP-D-77005")) == 1  # one run record
+
+
+def test_redispatch_of_paused_dispute_reports_pending_again(runner_factory):
+    first = runner_factory(*_happy_world(
+        "PP-D-77006",
+        refund_envelope=envelope_refund_pending(approval_id=43)))
+    outcome1 = first.run_dispute("PP-D-77006")
+    assert outcome1["status"] == "pending_approval"
+    assert outcome1["interrupt"]["approval_id"] == 43
+
+    second = runner_factory([], {})
+    outcome2 = second.run_dispute("PP-D-77006")
+    assert outcome2["already_completed"] is True
+    assert outcome2["status"] == "pending_approval"
+    assert outcome2["interrupt"]["approval_id"] == 43  # pause undisturbed
+
+
+# ---------------------------------------------------------------------------
+# The full chain: signed webhook -> outbox -> worker -> run -> audit
+# ---------------------------------------------------------------------------
+
+def _load_simulator():
+    path = (Path(__file__).resolve().parent.parent
+            / "scripts" / "simulate_dispute.py")
+    spec = importlib.util.spec_from_file_location("simulate_dispute", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_webhook_to_worker_end_to_end(runner_factory, make_agent, monkeypatch):
+    secret = "e2e-shared-secret"
+    _, api_key = make_agent()
+    monkeypatch.setenv("WEBHOOK_SHARED_SECRET", secret)
+    monkeypatch.setenv("AGENT_API_KEY", api_key)
+
+    # 1. A signed dispute event arrives at the real endpoint.
+    from main import app
+    sim = _load_simulator()
+    payload = sim.build_payload(dispute_id="PP-D-77007",
+                                event_id="WH-E2E-1")
+    raw = json.dumps(payload).encode()
+    with TestClient(app) as client:
+        r = client.post("/webhooks/paypal", content=raw, headers={
+            "Content-Type": "application/json",
+            "X-Tollgate-Signature": sim.sign(raw, secret)})
+    assert r.status_code == 200 and r.json()["job_created"] is True
+
+    # 2. The worker claims and dispatches it (scripted graph, real everything else).
+    script, responses = _happy_world("PP-D-77007")
+    runner = runner_factory(script, responses)
+    dispatcher = Dispatcher(runner.run_dispute,
+                            audit=GatewayAudit(get_engine(), api_key))
+    assert Worker(get_engine(), dispatcher, FAST).run_once() == 1
+
+    # 3. Every ledger agrees.
+    with session_scope() as s:
+        job = s.execute(select(WebhookOutbox)).scalar_one()
+    assert job.status == "processed"
+    assert job.dedup_key == "dispute:PP-D-77007"
+    rows = _agent_run_rows("webhook-PP-D-77007")
+    assert len(rows) == 1 and rows[0][2] == "refund_executed"
+    audit = _latest_run_audit()
+    assert audit.reason_code == "refund_executed"
+    assert audit.detail["dispute_id"] == "PP-D-77007"
+
+    # 4. A duplicate delivery of the SAME event changes nothing.
+    with TestClient(app) as client:
+        r2 = client.post("/webhooks/paypal", content=raw, headers={
+            "Content-Type": "application/json",
+            "X-Tollgate-Signature": sim.sign(raw, secret)})
+    assert r2.json()["status"] == "duplicate"
+    with session_scope() as s:
+        n = len(s.execute(select(WebhookOutbox)).scalars().all())
+    assert n == 1  # still exactly one job — one run per dispute

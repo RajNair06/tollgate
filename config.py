@@ -29,6 +29,18 @@ class Settings:
     # create the admin credential through the admin API — chicken and egg).
     # Empty string = admin routes disabled (fail-safe default).
     admin_api_key: str
+    # Webhook signature verification, dual strategy (fail-closed if neither
+    # is configured — the endpoint rejects rather than accepting unverified):
+    # - paypal_webhook_id: production path. PayPal signs each delivery with
+    #   its private key; we POST the transmission headers + raw body + this
+    #   id to PayPal's verify-webhook-signature API and trust only its OK.
+    # - webhook_shared_secret: dev/simulation path. scripts/simulate_dispute.py
+    #   signs the raw body with HMAC-SHA256 under this secret. PayPal cannot
+    #   sign locally simulated events (and sandbox cannot reach a local URL),
+    #   so the simulator needs a verifier that exercises the SAME endpoint,
+    #   parsing, and persistence path — only the crypto check differs.
+    paypal_webhook_id: str
+    webhook_shared_secret: str
 
 
 def get_settings() -> Settings:
@@ -59,4 +71,6 @@ def get_settings() -> Settings:
             os.environ.get("RATE_LIMIT_GLOBAL_PER_MIN", "600")
         ),
         admin_api_key=os.environ.get("ADMIN_API_KEY", "").strip(),
+        paypal_webhook_id=os.environ.get("PAYPAL_WEBHOOK_ID", "").strip(),
+        webhook_shared_secret=os.environ.get("WEBHOOK_SHARED_SECRET", "").strip(),
     )

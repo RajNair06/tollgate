@@ -10,6 +10,13 @@ audit_log   append-only record of every decision (no UPDATE/DELETE anywhere)
 events      immutable domain-event log
 outbox      transactional outbox: events written in the SAME transaction as
             the decision, published later by a relay (no lost notifications)
+webhook_events   accepted PayPal webhook deliveries (UNIQUE external event id
+            makes duplicate deliveries idempotent at the database level)
+webhook_outbox   job queue for the background worker: claimable rows with
+            attempts, backoff scheduling, lease timestamps, dead-lettering.
+            Separate from 'outbox' on purpose — that is a publish log
+            (pending/published/failed); this is a job queue
+            (pending/processing/processed/dead).
 
 Design choices
 --------------
@@ -59,6 +66,11 @@ AUDIT_DECISIONS = APPROVAL_STATUSES + ACTION_OUTCOMES + (
     "key_revoked",
     "agent_updated",
 )
+
+# Webhook pipeline vocabularies (migration e5f6a7b8c9d0).
+WEBHOOK_VERIFICATIONS = ("paypal", "shared_secret")
+WEBHOOK_JOB_TYPES = ("dispute_agent", "resume_agent")
+WEBHOOK_OUTBOX_STATUSES = ("pending", "processing", "processed", "dead")
 
 # Legal approval status transitions (application-enforced in approvals.py).
 APPROVAL_TRANSITIONS: dict[str, tuple[str, ...]] = {
@@ -338,3 +350,103 @@ class Outbox(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class WebhookEvent(Base):
+    """One accepted PayPal webhook delivery.
+
+    The UNIQUE constraint on external_event_id is the FIRST duplicate guard:
+    PayPal retries deliveries (and may deliver the same event more than once),
+    so the event id — not our processing — decides uniqueness. A duplicate
+    insert is caught, and the endpoint returns 200 without enqueueing again.
+
+    'verification' records WHICH strategy authenticated the delivery
+    ('paypal' = transmission-signature verification via the PayPal API,
+    'shared_secret' = local HMAC used by the dev simulator) — forensics
+    answer "how did this get in?" without re-deriving it.
+    """
+
+    __tablename__ = "webhook_events"
+    __table_args__ = (
+        CheckConstraint(
+            f"verification IN {WEBHOOK_VERIFICATIONS}",
+            name="ck_webhook_events_verification_valid",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    external_event_id: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    event_type: Mapped[str] = mapped_column(Text, nullable=False)  # CHECKOUT.DISPUTE.CREATED ...
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    verification: Mapped[str] = mapped_column(Text, nullable=False)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class WebhookOutbox(Base):
+    """Job queue consumed by the background worker (worker/ package).
+
+    Lifecycle: pending → processing (claimed via SELECT FOR UPDATE SKIP
+    LOCKED, claimed_at = lease start) → processed, or back to pending with
+    attempts++ and next_attempt_at pushed out exponentially, or → dead
+    after max attempts (last_error + failed_at preserved for the dashboard's
+    dead-letter view). Crash recovery: rows stuck in 'processing' past the
+    lease timeout are reclaimed — the worker never trusts claimed_at alone.
+
+    dedup_key is the SECOND duplicate guard: two DIFFERENT event ids that
+    reference the same dispute (e.g. created + updated) produce the same
+    key ("dispute:{id}"), and the partial unique index on
+    (job_type, dedup_key) makes the second enqueue a no-op. NULL = no dedup.
+    """
+
+    __tablename__ = "webhook_outbox"
+    __table_args__ = (
+        CheckConstraint(
+            f"job_type IN {WEBHOOK_JOB_TYPES}", name="ck_webhook_outbox_job_type_valid"
+        ),
+        CheckConstraint(
+            f"status IN {WEBHOOK_OUTBOX_STATUSES}", name="ck_webhook_outbox_status_valid"
+        ),
+        CheckConstraint("attempts >= 0", name="ck_webhook_outbox_attempts_nonneg"),
+        CheckConstraint(
+            "failed_at IS NULL OR failed_at >= created_at",
+            name="ck_webhook_outbox_failed_after_created",
+        ),
+        CheckConstraint(
+            "processed_at IS NULL OR processed_at >= created_at",
+            name="ck_webhook_outbox_processed_after_created",
+        ),
+        # Partial UNIQUE: only rows WITH a dedup_key participate.
+        Index(
+            "uq_webhook_outbox_dedup", "job_type", "dedup_key",
+            unique=True, postgresql_where=text("dedup_key IS NOT NULL"),
+        ),
+        # Claim query: WHERE status='pending' AND next_attempt_at <= now.
+        Index(
+            "ix_webhook_outbox_pending", "next_attempt_at",
+            postgresql_where=text("status = 'pending'"),
+        ),
+        # Lease-recovery sweep over stale 'processing' rows.
+        Index(
+            "ix_webhook_outbox_processing", "claimed_at",
+            postgresql_where=text("status = 'processing'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    job_type: Mapped[str] = mapped_column(Text, nullable=False)
+    dedup_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

@@ -22,7 +22,12 @@ loop:
 
 The reasoning/evidence text is deliberately worst-case: ~1000 chars,
 embedded newlines, quoted punctuation, and a 200-char unbroken token — the
-dashboard must wrap all of it inside the cell, never clip.
+dashboard must wrap all of it inside the cell, never clip. It is also
+self-identifying: the reasoning opens with a "[DEMO FIXTURE — synthetic
+text, not model output]" banner and every cited-evidence claim carries a
+"[demo fixture]" label, so nobody mistakes fixture prose for genuine
+agent claims (an operator once audited this text as a hallucination —
+the right instinct, the wrong suspect).
 
 Usage:
     uv run python scripts/demo_paused_run.py --approval-id 5 --action-id 66
@@ -61,6 +66,7 @@ LONG_TOKEN = (
 )
 
 WORST_CASE_REASONING = (
+    "[DEMO FIXTURE — synthetic text, not model output]\n\n"
     "Item-not-received dispute with NO delivery evidence anywhere in the packet.\n\n"
     "Findings:\n"
     "1. The capture completed on 2026-10-28 for the full order amount, and the "
@@ -94,21 +100,21 @@ def worst_case_decision(dispute_id: str) -> str:
         "cited_evidence": [
             {
                 "source": "transaction",
-                "claim": "capture COMPLETED for the order amount; remaining "
-                         "refundable balance covers the requested refund",
+                "claim": "[demo fixture] capture COMPLETED for the order amount; "
+                         "remaining refundable balance covers the requested refund",
                 "value": "10.99",
                 "transaction_id": CAPTURE_ID,
                 "observed_at": "2026-10-28T09:00:00Z",
             },
             {
                 "source": "dispute",
-                "claim": "reason code on record matches an item-not-received "
-                         "packet with no delivery evidence",
+                "claim": "[demo fixture] reason code on record matches an "
+                         "item-not-received packet with no delivery evidence",
                 "value": "MERCHANDISE_OR_SERVICE_NOT_RECEIVED",
             },
             {
                 "source": "dispute",
-                "claim": "buyer's own words (quotes, dashes, dates — punctuation stress)",
+                "claim": "[demo fixture] buyer's own words (quotes, dashes, dates — punctuation stress)",
                 "value": "\u201cPackage never arrived \u2014 30 days, no tracking movement "
                          "whatsoever. Emailed twice (2026-10-12, 2026-10-20), got "
                          "only an automated reply.\u201d",

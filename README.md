@@ -6,6 +6,14 @@ require human approval, deduplicate), enforces spending caps atomically,
 audits everything, and holds the PayPal credentials so agents never touch
 money directly.
 
+On top of that core it also runs the inbound side: PayPal dispute webhooks
+land in a signature-verified, deduplicated event log; a background outbox
+worker dispatches an autonomous dispute agent (LangGraph + Gemini) per
+dispute; and a static admin dashboard at `/dashboard/` lets operators read
+the agent's reasoning, approve or reject its proposed refunds, and watch the
+resumed run execute. The agent and the dashboard are just two more callers —
+real money moves only through the same policy engine.
+
 ## Architecture
 
 ```mermaid
@@ -13,31 +21,34 @@ flowchart LR
     subgraph Clients
         A1["AI agent<br/>X-API-Key"]
         A2["MCP client<br/>Bearer tg_..."]
-        DA["Dispute agent<br/>LangGraph + Gemini"]
     end
 
     ADMIN["Operator<br/>X-Admin-Key"]
+    DASH["Admin dashboard<br/>/dashboard/ (browser)"]
     HUMAN["Human approver"]
 
     subgraph Gateway["Toll Gate (FastAPI)"]
         REST["REST routes<br/>/v1/agent-actions, /v1/approvals"]
         MCP["MCP server<br/>/mcp (streamable HTTP)"]
+        WH["Webhook front door<br/>POST /webhooks/paypal<br/>verify → persist → enqueue"]
         AUTH["Auth + rate limit<br/>SHA-256 key lookup per request"]
         ENGINE["Policy engine<br/>lock agent row, dedup,<br/>allowlist, caps, threshold"]
         APPR["Approval workflow<br/>pending, approved, executed,<br/>rejected, expired, failed"]
-        ADM["Admin API<br/>agents, policies, keys, kill switch"]
+        ADM["Admin API<br/>agents, policies, keys, kill switch,<br/>decisions, dashboard reads"]
         PPC["PayPal client<br/>OAuth, idempotent requests"]
     end
 
-    PG[("PostgreSQL<br/>agents, keys, policies, actions,<br/>approvals, audit, events, outbox")]
+    WKR["Outbox worker<br/>python -m worker"]
+    DA["Dispute agent<br/>LangGraph + Gemini"]
+
+    PG[("PostgreSQL<br/>agents, keys, policies, actions,<br/>approvals, audit, events, outbox,<br/>webhook_events, webhook_outbox")]
     REDIS[("Redis<br/>rate-limit windows,<br/>token cache")]
     AGENTDB[("Agent DB<br/>checkpoints, agent_runs")]
     PAYPAL["PayPal API"]
 
     A1 --> REST
     A2 --> MCP
-    DA -->|MCP only| MCP
-    DA -.->|checkpoints| AGENTDB
+    PAYPAL -->|"dispute webhooks"| WH
 
     REST --> AUTH
     MCP --> AUTH
@@ -48,22 +59,34 @@ flowchart LR
     ENGINE -->|"pending_approval"| APPR
     ENGINE -->|"denied / deduplicated"| RESULT["Result returned to caller"]
     ENGINE ==>|"one transaction:<br/>action + audit + event + outbox"| PG
+    WH ==>|"one transaction:<br/>webhook_events + webhook_outbox"| PG
 
     APPR <--> HUMAN
     APPR -->|"approved, then execute"| PPC
     APPR --> PG
 
+    WKR -->|"claims jobs<br/>(SKIP LOCKED)"| PG
+    WKR -->|"runs / resumes"| DA
+    DA -->|"MCP only"| MCP
+    DA -.->|"checkpoints, agent_runs"| AGENTDB
+
     PPC --> PAYPAL
     PPC -.-> REDIS
 
     ADMIN --> ADM
+    ADMIN --> DASH
+    DASH -->|"reads + approve/reject"| ADM
     ADM --> PG
+    ADM -.->|"reads reasoning"| AGENTDB
 ```
 
-One process serves both doorways (REST + MCP); every request re-authenticates
-against PostgreSQL and Redis, and every decision lands in one transaction.
+One process serves both doorways (REST + MCP) plus the webhook front door;
+every request re-authenticates against PostgreSQL and Redis, and every
+decision lands in one transaction. The worker is a separate, deliberately
+poor process: no PayPal credentials, one queue DB, and the same MCP doorway
+as any other agent.
 
-Four subsystems, one repo:
+Seven subsystems, one repo:
 
 - **Policy engine** (PostgreSQL + Redis): agent identity, per-agent policies,
   atomic spending caps, approval workflow, append-only audit log.
@@ -80,8 +103,21 @@ Four subsystems, one repo:
   the MCP server as its only doorway — evidence gathering, LLM-drafted
   dispute responses, a hallucination-checking critic, a schema-validated
   refund decision, and a durable interrupt/resume across human approvals.
+  Its production runner lives in the worker (`worker/agent_runner.py`).
+- **Webhook pipeline** (`gateway/webhooks.py`): `POST /webhooks/paypal`
+  verifies every delivery (PayPal signature API in production, dev HMAC for
+  the simulator — fail-closed), persists the raw event, and enqueues the
+  worker's job in one transaction.
+- **Outbox worker** (`worker/`): `python -m worker` claims `webhook_outbox`
+  jobs with `SKIP LOCKED`, runs and resumes the dispute agent, retries
+  transient failures with backoff + jitter, dead-letters permanent ones, and
+  audits run outcomes back to the gateway.
+- **Admin dashboard** (`dashboard/` + `gateway/dashboard.py`): a static
+  AG Grid SPA served at `/dashboard/` — five read APIs, one-click
+  approve/reject wired to the atomic decision+resume endpoint, cells that
+  wrap instead of truncating, and vendored assets so it runs fully offline.
 
-## Data model (8 tables, `gateway/models.py`)
+## Data model (10 tables, `gateway/models.py`)
 
 | Table        | Role |
 |--------------|------|
@@ -93,10 +129,12 @@ Four subsystems, one repo:
 | `audit_log`  | Append-only record of **every** decision, including auth failures (nullable `agent_id`). FK with no cascade: audit rows block agent deletion |
 | `events`     | Immutable domain-event log (JSONB payloads) |
 | `outbox`     | Same events with `status` for a publish relay — written in the decision's transaction, so notifications can't be lost to a crash |
+| `webhook_events` | Every ACCEPTED PayPal webhook delivery: raw body kept verbatim, verification strategy recorded, UNIQUE `external_event_id` — the first duplicate guard |
+| `webhook_outbox` | Job queue for the outbox worker: claimable rows (`pending → processing → processed` / `dead`) with attempts, next-attempt backoff, lease timestamp, last error. Partial unique index `(job_type, dedup_key)` — the second duplicate guard: two DIFFERENT event ids about the SAME dispute enqueue ONE job |
 
 Money is `NUMERIC(12,2)` everywhere; statuses are `TEXT + CHECK` (widening a
 CHECK migrates cleanly, unlike `ALTER TYPE`). Schema evolves through Alembic
-(`alembic/versions/`, 3 migrations).
+(`alembic/versions/`, 7 migrations).
 
 ## How decisions stay correct under concurrency
 
@@ -140,6 +178,7 @@ the DB CHECKs at the edge.
 | `POST /v1/admin/agents/{id}/keys` | Issue an additional key (rotation: both keys live until the old one is revoked) |
 | `DELETE /v1/admin/keys/{key_id}` | Soft-revoke (idempotent). Takes effect on the running server immediately |
 | `GET /v1/admin/agents[/{id}]` | Ops views: policy + key prefixes (never hashes) |
+| `POST /v1/admin/approvals/{id}/decision` | The human decision path used by the dashboard: same state machine as the agent-facing endpoint (`approved`/`rejected`, row lock, 409 on illegal transitions), **plus** a `resume_agent` job enqueued into `webhook_outbox` in the SAME transaction. Commit-before-you-speak: a recorded decision always implies an (eventual) agent resume, and a resume job can never outlive a rolled-back decision. Dedup key `resume:{approval_id}` makes double-enqueue impossible at the database level |
 
 The admin credential is deliberately an env-var bootstrap secret, **not** an
 agent key — agents cannot provision or approve as admins. Because auth does a
@@ -151,6 +190,38 @@ response can never outrun the commit. Every mutation is audited
 (`agent_created` / `agent_updated` / `key_issued` / `key_revoked`) in the
 same transaction as the change; `agent_updated` carries the actor and a
 before/after diff of exactly the fields that changed.
+
+### Dashboard reads (`/v1/admin/dashboard/*`, auth: `X-Admin-Key` at router level)
+
+Full-fidelity JSON for the SPA — nothing is truncated server-side:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /actions` | Recent actions with agent name and the policy snapshot in effect |
+| `GET /audit` | Audit feed, filterable by `decision`, `agent_id`, `action_type`, `since`, `until` |
+| `GET /approvals` | Approvals (default `status=pending`) joined with the agent DB: the paused run's reasoning, confidence, and cited evidence. The join happens in Python (psycopg) — no cross-DB foreign key — and if the agent DB is unreachable the rows degrade to `agent: null` instead of failing |
+| `GET /metrics` | Counters, money totals, median decision latency (`percentile_cont`), agent-run status mix |
+| `GET /dead-letter` | Dead worker jobs with the FULL last error, stack traces included |
+
+### Webhook (`POST /webhooks/paypal` — no agent auth; the signature IS the identity)
+
+Two verification strategies, selected by header presence:
+
+- **Production (`paypal`)**: the five `PAYPAL-*` transmission headers, the
+  raw body verbatim, and `PAYPAL_WEBHOOK_ID` go to PayPal's
+  `verify-webhook-signature` API; only its `SUCCESS` is trusted. Verifier
+  unreachable → **502, fail closed** — an unverifiable delivery is not an
+  accepted delivery, and PayPal retries on non-2xx.
+- **Dev (`shared_secret`)**: an `X-Tollgate-Signature: sha256=<hex>` header —
+  HMAC-SHA256 over the exact raw bytes under `WEBHOOK_SHARED_SECRET`. This
+  is what `scripts/simulate_dispute.py` sends, so the simulator exercises
+  the same endpoint, parsing, and persistence path as production; only the
+  crypto check differs.
+
+Bad/missing signature → 401, malformed event → 400, neither strategy
+configured → 503. On accept, ONE transaction writes the `webhook_events`
+row plus a `webhook_outbox` job (`dispute_agent`, dedup key
+`dispute:{id}`) and answers 200 fast — everything else is the worker's job.
 
 ### MCP server (`/mcp`, streamable HTTP)
 
@@ -271,6 +342,13 @@ uv run python -m agent.run_dispute PP-D-56244        # fresh run
 uv run python -m agent.run_dispute --resume run-... --approved   # or --rejected
 ```
 
+That CLI is the manual doorway. In production the same graph runs inside the
+outbox worker (`worker/agent_runner.py`): `run_id = thread_id =
+webhook-{dispute_id}`, a checkpoint pre-check makes at-least-once dispatch
+idempotent, and a pause writes a provisional `agent_runs` row carrying the
+FULL decision (reasoning + cited evidence) linked by `approval_id` — that
+row is what the dashboard shows while the run waits for its human.
+
 Live proof (sandbox, `gemini-3.1-flash-lite`; `gemini-3.8-flash` was
 returning 503 high-demand at demo time — the retry ladder with jitter
 handled it exactly as designed before the model fallback):
@@ -288,6 +366,118 @@ handled it exactly as designed before the model fallback):
   `RESOURCE_NOT_FOUND` (PayPal `debug_id` included) → terminal
   `evidence_failed` with 0 LLM calls; checkpoint + `agent_runs` rows
   verified in PostgreSQL.
+
+## Webhook pipeline & outbox worker (`worker/`)
+
+```mermaid
+flowchart TD
+    P["PayPal dispute webhook"] -->|"signed delivery"| W["POST /webhooks/paypal"]
+    W -->|"ONE transaction"| DB[("webhook_events +<br/>webhook_outbox job")]
+    DB -->|"claim: SKIP LOCKED"| K["Worker (python -m worker)"]
+    K -->|"dispute_agent job"| R["Run the dispute graph<br/>run_id = thread_id = webhook-{dispute_id}"]
+    R -->|"allowed"| X["Refund executed via MCP"]
+    R -->|"pending_approval"| PAUSE["Pause: checkpoint + provisional<br/>agent_runs row (full decision)"]
+    PAUSE -->|"operator clicks approve/reject"| DEC["POST /v1/admin/approvals/{id}/decision"]
+    DEC -->|"SAME transaction"| DB2[("resume_agent job<br/>dedup resume:{approval_id}")]
+    DB2 -->|"claim"| K2["Worker resumes the checkpoint"]
+    K2 -->|"approved"| EX["execute_approved_refund via MCP<br/>money moves exactly once"]
+    K2 -->|"rejected"| NO["refund_not_approved — nothing moves"]
+    X & EX & NO -->|"agent_run_finished audit"| AUD[("gateway audit_log")]
+```
+
+Every way this could lose, duplicate, or double-spend is guarded:
+
+- **At-least-once dispatch is safe.** `run_id = thread_id = webhook-{dispute_id}`
+  is deterministic, so a checkpoint pre-check before running turns a
+  redelivery into an `already_completed` no-op.
+- **Claims** are short `FOR UPDATE SKIP LOCKED` transactions; handlers run
+  OUTSIDE the transaction, so a slow agent never holds row locks.
+- **Classification defaults to retryable.** `PermanentJobError`
+  (`evidence_failed`, `schema_failed`, `rejected_by_critic`,
+  `budget_exceeded`, and the resume rails `NO_RUN_FOR_APPROVAL` /
+  `NO_CHECKPOINT` / `NOT_PAUSED` / `APPROVAL_MISMATCH`) dead-letters
+  immediately; transient markers (`GATEWAY_UNREACHABLE`, PayPal 429/5xx,
+  network errors) retry with exponential backoff × jitter [0.75, 1.25]
+  (base 2 s, cap 300 s) up to `WORKER_MAX_ATTEMPTS` (5) — then dead, with
+  the full error kept for the dead-letter panel.
+- **Lease sweep.** A `processing` row older than `WORKER_LEASE_SECONDS` is
+  presumed crashed and reclaimed, or dead-lettered if attempts are spent.
+- **Resume moves money once.** A redelivered resume job finds the approval
+  already decided and records the outcome; the refund itself rides the
+  gateway's deterministic `PayPal-Request-Id` and the executed-approval
+  state machine, so retries can't double-refund.
+- **Audit before finalize.** The dispatcher writes an `agent_run_finished`
+  audit row (reason = the run's terminal status) to the gateway DB before
+  marking the job processed, on both the run and resume paths.
+- **The worker holds no PayPal credentials.** One secret (the queue DB
+  URL); its agent side is a regular `tg_` key against the MCP server, so
+  every refund passes the policy engine like any other agent's.
+
+Run it: `uv run python -m worker` (reads `.env`; requires `AGENT_API_KEY`
+and `GEMINI_API_KEY`; tunables are the `WORKER_*` vars — see
+`.env.example`).
+
+## Admin dashboard (`/dashboard/`)
+
+A static SPA served by the gateway itself — no build step, no CDN: AG Grid
+Community 31.3.4 is vendored under `dashboard/vendor/` (fonts are data
+URIs), so the page works fully offline. First load prompts for the admin
+key (`ADMIN_API_KEY`), stores it in localStorage, and sends it as
+`X-Admin-Key`; a 401 re-prompts, and an unreachable agent DB shows a
+banner instead of blank reasoning cells.
+
+Panels: **Approvals** (full width, top) with one-click Approve/Reject — the
+confirm dialog names the amount and warns that approving executes a real
+refund; `decided_by` is asked once and remembered. Then **Actions** and
+**Audit** side by side, and **Dead letter** full width. Every panel polls
+on a 2-second tick (ticks never overlap) and uses `getRowId` +
+immutable-data diffing, so live updates don't flicker or reset scroll
+position.
+
+The no-truncation contract — operators must see *everything*, and
+`tests/test_dashboard_static.py` pins it:
+
+- `wrapText: true` + `autoHeight: true` on every column; rows grow to fit
+  their content.
+- CSS forces `white-space: pre-wrap` + `overflow-wrap: anywhere` on
+  `.ag-cell`, so a 1.3k-char reasoning paragraph, multiline stack traces,
+  a 240-char unbroken token, and 1.8 KB JSON detail blobs all wrap inside
+  the cell — never clipped, never overlapping.
+- `ellipsis` is banned from the html/css/js; text selection is pinned on
+  (`enableCellTextSelection` + `ensureDomOrder`; `suppressCellFocus`
+  banned) so reasoning, ids, and errors are copyable.
+- Timestamps render as two lines (date + time), never a clipped string.
+
+### Demo runbook (sandbox)
+
+The PayPal sandbox cannot generate real disputes, so two scripts bridge the
+gap — both hit REAL components:
+
+```bash
+# 1. Webhook path: sign + POST a dispute event through the real endpoint
+#    (dev HMAC strategy; WEBHOOK_SHARED_SECRET must match the gateway's).
+WEBHOOK_SHARED_SECRET=dev-shared-secret uv run python scripts/simulate_dispute.py
+# The simulated dispute does not exist in the sandbox, so the dispatched
+# run fails fast with a real RESOURCE_NOT_FOUND → dead-letter row (which
+# is itself pipeline demo material).
+
+# 2. Full approve→resume→refund loop: create a REAL pending approval
+#    (POST /v1/agent-actions above the agent's threshold against a real
+#    sandbox capture), then seed a paused run linked to it:
+uv run python scripts/demo_paused_run.py --approval-id 6 --action-id 70 \
+    --dispute-id PP-D-90002
+# Real graph, real checkpointer, real AgentRunner — scripted world
+# (ScriptedLLM + FakeRegistry). Its reasoning text is hand-written fixture
+# prose and says so: it opens with "[DEMO FIXTURE — synthetic text, not
+# model output]" and every cited-evidence claim is labeled "[demo
+# fixture]". None of it is model output.
+
+# 3. Open http://localhost:8000/dashboard/, read the reasoning, click
+#    Approve — the real worker resumes the checkpoint and executes a real
+#    sandbox refund. The audit chain afterwards:
+#    APPROVED_BY_OPERATOR → PAYPAL_REFUND_COMPLETED →
+#    agent_run_finished: refund_executed_after_approval.
+```
 
 ## Requirements
 
@@ -308,8 +498,13 @@ docker run -d --name tollgate-redis -p 6380:6379 redis:7-alpine
 uv sync
 cp .env.example .env    # fill PayPal creds; generate ADMIN_API_KEY:  tga_$(openssl rand -hex 24)
 uv run alembic upgrade head
-uv run uvicorn main:app --port 8000
+uv run uvicorn main:app --port 8000   # gateway: REST + MCP + webhook + dashboard
+uv run python -m worker               # outbox worker (separate process)
 ```
+
+The agent's own database (checkpoints + `agent_runs`) is created and
+migrated automatically on first use (`agent/checkpoint.py` connects to the
+server, `CREATE DATABASE`s the target, and runs the LangGraph saver setup).
 
 ## Usage
 
@@ -352,6 +547,17 @@ partial refund → idempotent replay; refuses to run outside sandbox):
 uv run python scripts/toll_flow.py
 ```
 
+Webhook pipeline + dashboard (full flow in the demo runbook above):
+
+```bash
+uv run python -m worker    # terminal 2: consumes webhook_outbox jobs
+
+# terminal 3: fire a signed test webhook at the real endpoint
+WEBHOOK_SHARED_SECRET=dev-shared-secret uv run python scripts/simulate_dispute.py
+
+# browser: http://localhost:8000/dashboard/  (prompts for ADMIN_API_KEY)
+```
+
 Call a tool over MCP with raw HTTP (streamable HTTP is plain JSON-RPC;
 `initialize` returns an `mcp-session-id` header to reuse):
 
@@ -377,7 +583,7 @@ executed end-to-end (real refund `92F13256LW3371821`, audit rows
 ## Tests
 
 ```bash
-uv run pytest        # 135 tests, ~3 min — requires the Docker containers running
+uv run pytest        # 239 tests, ~6 min — requires the Docker containers running
 ```
 
 Runs against a real PostgreSQL test database (`tollgate_test`, created and
@@ -407,18 +613,33 @@ test runs the graph to the approval interrupt in a subprocess, lets the
 process exit, and resumes in a second subprocess: state is carried by
 PostgreSQL alone.
 
+The webhook pipeline and worker are tested against the same real
+PostgreSQL: verification fail-closed paths (bad/missing signature, verifier
+unreachable, no strategy configured), both duplicate guards (external event
+id + job dedup key), claim/backoff/lease/dead-letter mechanics, the dispatch
+classification matrix, and the resume safety rails — money moves once even
+on redelivery. The admin decision endpoint's atomicity is proven by making
+the job enqueue fail AFTER `decide()`: everything rolls back. The five
+dashboard read APIs are covered including the cross-DB reasoning join and
+agent-DB-down degradation, and the frontend has a static contract test:
+served assets, the no-truncation pins (wrapText/autoHeight/pre-wrap,
+ellipsis banned), and copyability (enableCellTextSelection required,
+suppressCellFocus banned).
+
 
 
 
 ## Project layout
 
 ```
-config.py               env-driven settings (PayPal, DB, Redis, rate limits, admin key)
+config.py               env-driven settings (PayPal, DB, Redis, rate limits, admin key,
+                        webhook id + shared secret, agent DB url)
 main.py                 FastAPI app, lifespan (PayPal client w/ Redis token cache,
-                        MCP session manager), MCP sub-app mounted at /mcp
+                        MCP session manager); route order: REST/admin/webhook/dashboard
+                        routers → /dashboard static mount → MCP catch-all
 gateway/
   paypal_client.py      PayPal REST client (pluggable TokenCache)
-  models.py             the 8 tables + vocabularies + transition map
+  models.py             the 10 tables + vocabularies + transition map
   db.py                 engine, session_scope (transaction contract)
   api_keys.py           key generation + SHA-256 hashing
   auth.py               request pipeline: get_db → auth → rate limit
@@ -428,9 +649,13 @@ gateway/
   redis_client.py       token cache + fixed-window rate limits
   schemas.py            strict Pydantic request/response models
   routes.py             agent-facing endpoints
-  admin.py              admin endpoints (create/patch agents, keys, views)
+  admin.py              admin endpoints (create/patch agents, keys, views,
+                        approval decision + atomic resume enqueue)
   mcp_server.py         MCP tools (streamable HTTP), header auth, PayPal execution glue
-alembic/                migrations (schema → perf index → agent_keys)
+  webhooks.py           POST /webhooks/paypal: dual verification, dedup, enqueue
+  dashboard.py          five read APIs (cross-DB reasoning join, graceful degradation)
+alembic/                migrations (schema → perf index → agent_keys → cap release →
+                        audit vocabulary → webhook tables → run-finished vocabulary)
 agent/
   config.py             env-driven agent settings (MCP url, keys, model, budget)
   gemini_client.py      Gemini wrapper: backoff+jitter, error classes, metering
@@ -442,14 +667,31 @@ agent/
   state.py              AgentState + RefundDecision/CitedEvidence schemas
   graph.py              LangGraph: nodes, critic guards, routing, interrupt
   checkpoint.py         agent-database bootstrap + PostgresSaver
-  runs.py               agent_runs telemetry table (upsert)
+  runs.py               agent_runs telemetry table (upsert, approval_id link)
   run_dispute.py        CLI: fresh runs + --resume --approved/--rejected
   testing.py            ScriptedLLM/FakeRegistry + canned gateway envelopes
+worker/
+  config.py             WorkerSettings from WORKER_* env (fail-loud validation)
+  errors.py             PermanentJobError / RetryableJobError + classify()
+  queue.py              webhook_outbox ops: enqueue, claim (SKIP LOCKED), reschedule,
+                        mark dead/processed, lease recovery
+  worker.py             poll loop, backoff schedule, signal handling
+  dispatch.py           dispute_agent/resume_agent handlers, classification matrix,
+                        GatewayAudit (agent_run_finished rows)
+  agent_runner.py       AgentRunner: idempotent run_dispute + resume_approval w/ rails
+dashboard/
+  index.html            SPA shell: admin-key prompt, panels, degradation banners
+  styles.css            dark theme; no-truncation cell CSS (pre-wrap + anywhere)
+  app.js                polling client, AG Grid defs, DecisionCell, evidence/JSON renderers
+  vendor/               AG Grid Community 31.3.4 (UMD + CSS, fully offline)
 scripts/
   create_agent.py       CLI provisioning (prints key once)
   toll_flow.py          live PayPal sandbox end-to-end demo
-tests/                  135 tests (real Postgres + MockTransport + real MCP over HTTP
-                        + scripted-LLM agent tests + cross-process resume proof)
+  simulate_dispute.py   signed test webhook against the real endpoint (dev HMAC)
+  demo_paused_run.py    seeds a [DEMO FIXTURE] paused run linked to a real approval
+tests/                  239 tests (real Postgres + MockTransport + real MCP over HTTP
+                        + scripted-LLM agent tests + cross-process resume proof
+                        + webhook/worker/dashboard suites + static contract tests)
 ```
 
 ## License

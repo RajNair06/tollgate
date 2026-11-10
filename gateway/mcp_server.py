@@ -87,8 +87,13 @@ TransactionId = Annotated[
 DisputeId = Annotated[
     str,
     Field(
-        pattern=r"^PP-D-\d{1,12}$",
-        description="PayPal dispute ID, e.g. PP-D-56244.",
+        # Real dispute ids come in several families: PP-D-56244 in the docs,
+        # PP-R-LUV-10198013 for Resolution-Center-filed sandbox cases (proven
+        # by live webhook traffic 2026-11-10 — the old narrow pattern
+        # dead-lettered a real run with string_pattern_mismatch). Accept any
+        # PP- prefixed uppercase id; PayPal owns the full schema.
+        pattern=r"^PP-[A-Z0-9-]{1,40}$",
+        description="PayPal dispute ID, e.g. PP-D-56244 or PP-R-LUV-10198013.",
     ),
 ]
 

@@ -295,6 +295,19 @@ def test_dispute_id_format_enforced(server, make_agent):
         call_tool(server, key, "get_dispute", {"dispute_id": "not-a-dispute"})
 
 
+def test_real_dispute_id_shapes_accepted(server, make_agent, fresh_mock):
+    """Regression: real sandbox dispute ids also look like PP-R-LUV-10198013
+    (Resolution-Center-filed cases), not just the docs' PP-D-56244. The old
+    narrow pattern rejected them at the MCP boundary (string_pattern_mismatch)
+    and dead-lettered a live webhook run."""
+    _, key = make_agent()
+    detail = call_tool(server, key, "get_dispute",
+                       {"dispute_id": "PP-R-LUV-10198013"}).data
+    assert detail["dispute"]["reason"] == "MERCHANDISE_OR_SERVICE_NOT_RECEIVED"
+    assert _paypal_paths(fresh_mock) == [
+        "/v1/customer/disputes/PP-R-LUV-10198013"]
+
+
 # ---------------------------------------------------------------------------
 # Policy enforcement through the engine (checklist: denied / pending)
 # ---------------------------------------------------------------------------

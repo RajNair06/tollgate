@@ -44,6 +44,7 @@ from agent.gemini_client import GeminiClient
 from agent.graph import build_graph
 from agent.runs import RunLog
 from agent.tools import build_tollgate_registry
+from worker.dispatch import classify_run
 from worker.errors import PermanentJobError
 
 logger = logging.getLogger(__name__)
@@ -125,12 +126,29 @@ class AgentRunner:
                         "already_completed": True}
             status = snapshot.values.get("status")
             if status and status != RUNNING:
-                logger.info("Run %s already finished (%s) — not re-running", run_id, status)
-                return {"run_id": run_id, "dispute_id": dispute_id,
-                        "status": status,
-                        "summary": snapshot.values.get("summary") or status,
-                        "usage": snapshot.values.get("usage") or {},
-                        "already_completed": True}
+                summary = snapshot.values.get("summary") or ""
+                if classify_run(status, summary) == "retryable":
+                    # Transient failure (LLM 503, gateway timeout, ...).
+                    # Returning the cached outcome here would make every job
+                    # retry a no-op: the worker burns all attempts re-reading
+                    # the same terminal checkpoint (seen live 2026-11-10:
+                    # 5 attempts, zero LLM calls, then dead-letter). Clear
+                    # the thread and fall through to a real re-run.
+                    # Money-safety: llm_error/evidence_failed happen before
+                    # any refund request, and the request/execute phases
+                    # replay through the deterministic per-run idempotency
+                    # key — a re-run can never move money twice.
+                    logger.info("Run %s failed transiently (%s) — clearing "
+                                "checkpoint and re-running", run_id, status)
+                    self._saver.delete_thread(run_id)
+                else:
+                    logger.info("Run %s already finished (%s) — not re-running",
+                                run_id, status)
+                    return {"run_id": run_id, "dispute_id": dispute_id,
+                            "status": status,
+                            "summary": summary or status,
+                            "usage": snapshot.values.get("usage") or {},
+                            "already_completed": True}
 
         result = graph.invoke(
             {"run_id": run_id, "dispute_id": dispute_id, "status": RUNNING},

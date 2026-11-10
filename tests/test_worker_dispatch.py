@@ -29,6 +29,7 @@ from sqlalchemy import select
 from agent.budget import RunMeter
 from agent.checkpoint import ensure_database, open_checkpointer
 from agent.config import AgentSettings
+from agent.gemini_client import LLMError
 from agent.graph import build_graph
 from agent.runs import RunLog
 from agent.testing import (
@@ -349,6 +350,28 @@ def test_redispatch_of_finished_dispute_is_not_rerun(runner_factory):
     assert outcome2["already_completed"] is True
     assert outcome2["status"] == "refund_executed"
     assert len(_agent_run_rows("webhook-PP-D-77005")) == 1  # one run record
+
+
+def test_transient_llm_failure_reruns_instead_of_caching(runner_factory):
+    """Live-rehearsal bug (2026-11-10): an llm_error checkpoint used to
+    short-circuit every job retry ("already finished (llm_error) — not
+    re-running"), burning all 5 attempts with zero LLM calls before
+    dead-lettering. A retryable terminal status must clear the thread and
+    re-run for real; verdict statuses stay cached (test above)."""
+    _, responses = _happy_world("PP-D-77010")
+    broken = runner_factory([LLMError("503 UNAVAILABLE: high demand")],
+                            responses)
+    out1 = broken.run_dispute("PP-D-77010")
+    assert out1["status"] == "llm_error"
+
+    # The job retry: the provider recovered and a full happy script is
+    # available — the run must actually execute it, not replay the cache.
+    script, responses = _happy_world("PP-D-77010")
+    healthy = runner_factory(script, responses)
+    out2 = healthy.run_dispute("PP-D-77010")
+    assert out2.get("already_completed") is not True
+    assert out2["status"] == "refund_executed"
+    assert len(_agent_run_rows("webhook-PP-D-77010")) == 1
 
 
 def test_redispatch_of_paused_dispute_reports_pending_again(runner_factory):

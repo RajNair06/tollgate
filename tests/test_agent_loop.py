@@ -487,6 +487,26 @@ def test_prompt_v6_bans_merchant_record_claims():
     assert "v6" in available_versions()
 
 
+def test_refund_decision_accepts_real_paypal_dispute_ids():
+    """Live schema_failed (2026-11-10): the gateway's DisputeId was relaxed
+    for real Resolution-Center ids (61abff8), but the agent side still
+    pinned ^PP-D-\\d{1,12}$ — the model echoed the correct id
+    (PP-R-LUV-10198013) and our OWN schema rejected it. This test keeps
+    both sides of the wire aligned."""
+    import re
+
+    from agent.state import DISPUTE_ID_PATTERN, RefundDecision
+    from agent.testing import decision_json
+
+    assert re.fullmatch(DISPUTE_ID_PATTERN, "PP-R-LUV-10198013")
+    assert re.fullmatch(DISPUTE_ID_PATTERN, "PP-D-56244")     # demo ids too
+    assert not re.fullmatch(DISPUTE_ID_PATTERN, "not-a-dispute")
+    decision = RefundDecision.model_validate_json(
+        decision_json(dispute_id="PP-R-LUV-10198013"),
+        context={"min_confidence": 0.6})
+    assert decision.dispute_id == "PP-R-LUV-10198013"
+
+
 def test_min_confidence_env_parsing(monkeypatch):
     from agent.config import get_agent_settings
     from agent.state import MIN_CONFIDENCE_FOR_ACTION

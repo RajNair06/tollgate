@@ -25,7 +25,12 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, model_validat
 # Same vocabularies as the gateway's MCP layer — one wire language end to end.
 CURRENCIES = ("USD", "EUR", "GBP", "CAD", "AUD", "INR")
 TXN_ID_PATTERN = r"^[A-Z0-9]{17}$"
-DISPUTE_ID_PATTERN = r"^PP-D-\d{1,12}$"
+# Relaxed 2026-11-10 to match the gateway's DisputeId (commit 61abff8):
+# real PayPal dispute ids come in several families (PP-D-56244 in docs,
+# PP-R-LUV-10198013 from the Resolution Center). The stale strict pattern
+# schema_failed the first live run to reach decide_refund — the model
+# echoed the correct id and our own schema rejected it.
+DISPUTE_ID_PATTERN = r"^PP-[A-Z0-9-]{1,40}$"
 TIMESTAMP_PATTERN = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$"
 
 # Below this confidence the schema refuses any automatic action.

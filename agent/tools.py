@@ -120,8 +120,9 @@ def _call_mcp(url: str, api_key: str, tool_name: str, arguments: dict) -> Any:
 # (the MCP server enforces them; these tell the LLM what to produce).
 _TXN_ID = {"type": "string", "pattern": "^[A-Z0-9]{17}$",
            "description": "PayPal transaction/capture ID (17 uppercase alphanumeric)."}
-_DISPUTE_ID = {"type": "string", "pattern": "^PP-D-\\d{1,12}$",
-               "description": "PayPal dispute ID, e.g. PP-D-56244."}
+_DISPUTE_ID = {"type": "string", "pattern": "^PP-[A-Z0-9-]{1,40}$",
+               "description": "PayPal dispute ID, e.g. PP-D-56244 or "
+                              "PP-R-LUV-10198013."}
 _IDEM_KEY = {"type": "string", "minLength": 8, "maxLength": 64,
              "pattern": "^[A-Za-z0-9_-]+$",
              "description": "Idempotency key; replays return the original decision."}

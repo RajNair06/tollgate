@@ -343,6 +343,25 @@ def test_prompt_loader_reads_v1_and_fails_loudly():
     assert "v1" in available_versions()
 
 
+def test_prompt_v2_fixes_refund_intent_wording():
+    """v2 (2026-11-10, live rehearsal): the draft wrote "We are issuing a
+    partial refund"; the critic read the intent as an unsupported factual
+    claim and the run ended rejected_by_critic — no money moved, but the
+    verdict was wrong. v2 tells the drafter the refund is strictly FUTURE,
+    and tells the critic that intent statements are not evidence claims.
+    v1 stays byte-identical so pinned runs remain reproducible."""
+    for name in ("draft_response", "critic", "decide_refund", "loop_system"):
+        assert load_prompt(name, "v2")
+    draft = load_prompt("draft_response", "v2")
+    assert "never as an action in progress or completed" in draft
+    critic = load_prompt("critic", "v2")
+    assert "statements of intent" in critic.lower()
+    # v1 must NOT have picked up the clauses (immutability of old versions)
+    assert "statements of intent" not in load_prompt("critic", "v1").lower()
+    assert "in progress or completed" not in load_prompt("draft_response", "v1")
+    assert "v2" in available_versions()
+
+
 def test_min_confidence_env_parsing(monkeypatch):
     from agent.config import get_agent_settings
     from agent.state import MIN_CONFIDENCE_FOR_ACTION

@@ -54,6 +54,52 @@ class LLMResult:
     output_tokens: int
 
 
+# Gemini structured output accepts only an OpenAPI 3.0 subset. Keys outside
+# it are dropped; passing the pydantic class to the SDK instead emits
+# snake_case "additional_properties" (from extra="forbid"), which the proto
+# rejects with 400 INVALID_ARGUMENT (field-verified 2026-11-10).
+_GEMINI_KEEP = {"type", "format", "description", "enum", "items",
+                "required", "properties", "nullable", "propertyOrdering"}
+
+
+def _gemini_clean(node: Any, defs: dict) -> Any:
+    if not isinstance(node, dict):
+        return node
+    if "$ref" in node:
+        return _gemini_clean(defs[node["$ref"].rsplit("/", 1)[-1]], defs)
+    out: dict[str, Any] = {}
+    for key, value in node.items():
+        if key == "anyOf":
+            # pydantic renders Optional[X] as anyOf=[X-schema, {"type":"null"}];
+            # Gemini wants the sub-schema plus nullable=true.
+            real = [s for s in value if s != {"type": "null"}]
+            if len(real) == 1:
+                sub = _gemini_clean(real[0], defs)
+                if isinstance(sub, dict):
+                    out.update(sub)
+                    out["nullable"] = True
+        elif key == "allOf" and len(value) == 1:
+            out.update(_gemini_clean(value[0], defs))
+        elif key == "properties":
+            out["properties"] = {k: _gemini_clean(v, defs)
+                                 for k, v in value.items()}
+        elif key == "items":
+            out["items"] = _gemini_clean(value, defs)
+        elif key in _GEMINI_KEEP:
+            out[key] = value
+        # Everything else (title, default, pattern, minLength, $defs,
+        # additionalProperties, ...) is silently dropped: unsupported or
+        # actively rejected by the API.
+    return out
+
+
+def to_gemini_schema(model: Any) -> dict:
+    """pydantic model -> OpenAPI dict Gemini structured output accepts."""
+    schema = model.model_json_schema()
+    defs = schema.pop("$defs", {})
+    return _gemini_clean(schema, defs)
+
+
 class LLMClient(Protocol):
     """What the loop agent and the graph nodes depend on. GeminiClient
     implements it for real; tests implement it with scripted responses."""
@@ -65,6 +111,7 @@ class LLMClient(Protocol):
         system: str | None = None,
         tools: Sequence[Any] | None = None,
         temperature: float | None = None,
+        response_schema: Any | None = None,
     ) -> LLMResult: ...
 
 
@@ -132,6 +179,7 @@ class GeminiClient:
         system: str | None = None,
         tools: Sequence[Any] | None = None,
         temperature: float | None = None,
+        response_schema: Any | None = None,
     ) -> LLMResult:
         if self.meter is not None:
             self.meter.check_headroom()  # raises LLMBudgetExceeded before any I/O
@@ -145,6 +193,16 @@ class GeminiClient:
             config_kwargs["tools"] = list(tools)
         if temperature is not None:
             config_kwargs["temperature"] = temperature
+        if response_schema is not None:
+            # Constrained decoding: the API guarantees schema-shaped JSON.
+            # Field names were a GUESS until 2026-11-10 — flash-lite guessed
+            # {"decision": ...} instead of {"proposed_action": ...} and
+            # schema_failed the first live run to reach decide_refund.
+            config_kwargs["response_mime_type"] = "application/json"
+            # Never hand the SDK the pydantic class: its converter emits
+            # snake_case additional_properties → 400. Send the cleaned
+            # OpenAPI-subset dict instead.
+            config_kwargs["response_schema"] = to_gemini_schema(response_schema)
         config = types.GenerateContentConfig(**config_kwargs)
 
         last_exc: Exception | None = None

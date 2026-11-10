@@ -66,11 +66,13 @@ def _fail(status: str, error: str) -> dict:
     return {"status": status, "error": error}
 
 
-def _safe_generate(llm: LLMClient, user_text: str, system: str) -> tuple[str | None, str | None]:
+def _safe_generate(llm: LLMClient, user_text: str, system: str,
+                   response_schema: Any | None = None) -> tuple[str | None, str | None]:
     """One LLM call; returns (text, None) or (None, error). Budget and LLM
     failures become errors the calling node turns into terminal statuses."""
     try:
-        result = llm.generate([user_text], system=system)
+        result = llm.generate([user_text], system=system,
+                              response_schema=response_schema)
         return result.text, None
     except LLMBudgetExceeded as exc:
         return None, f"budget_exceeded: {exc}"
@@ -111,6 +113,13 @@ def build_graph(
     # validator then rejects.
     prompts["decide_refund"] = prompts["decide_refund"].replace(
         "{{MIN_CONFIDENCE}}", str(min_confidence))
+    # The prompt promises "the schema you are given" — actually give it.
+    # Until 2026-11-10 no schema was in the request at all: models guessed
+    # field names, and flash-lite guessed wrong (schema_failed, live).
+    # The placeholder exists from v5; the replace is a no-op on older pins.
+    prompts["decide_refund"] = prompts["decide_refund"].replace(
+        "{{DECISION_SCHEMA}}",
+        json.dumps(RefundDecision.model_json_schema(), indent=2))
 
     # -- nodes -----------------------------------------------------------------
 
@@ -202,7 +211,8 @@ def build_graph(
             llm,
             f"EVIDENCE PACKET:\n{packet}\n\nCRITIC-APPROVED DRAFT:\n{state['draft']}\n\n"
             f"Dispute: {state['dispute_id']}. Reply with the decision JSON.",
-            prompts["decide_refund"])
+            prompts["decide_refund"],
+            response_schema=RefundDecision)
         if err:
             return _fail(err.split(":")[0], err)
 

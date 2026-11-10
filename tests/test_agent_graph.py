@@ -24,6 +24,7 @@ from agent.budget import LLMBudgetExceeded, RunMeter
 from agent.checkpoint import ensure_database, open_checkpointer
 from agent.graph import build_graph
 from agent.runs import RunLog
+from agent.state import RefundDecision
 from agent.testing import (
     CAPTURE_ID,
     CLEAN_DRAFT,
@@ -104,6 +105,29 @@ def test_happy_path_refund_executed(agent_db):
     assert len(records) == 1
     assert records[0]["run_id"] == run_id
     assert records[0]["status"] == "refund_executed"
+
+
+def test_decide_call_enforces_schema_and_v5_prompt_renders_it(agent_db):
+    """Schema enforcement (2026-11-10, live schema_failed): the prompt said
+    "matching the schema you are given" but nothing ever sent a schema —
+    flash-lite invented field names ({"decision": ...} for "proposed_action").
+    Now the decide_refund call passes RefundDecision as response_schema
+    (constrained decoding forbids wrong field names at the API), and v5+
+    prompts carry the rendered schema in the text too."""
+    llm = ScriptedLLM([CLEAN_DRAFT, CRITIC_OK, decision_json()])
+    registry = FakeRegistry({**HAPPY_RESPONSES,
+                             "issue_refund": envelope_refund_executed()})
+    graph = build_graph(llm, registry, prompt_version="v5",
+                        checkpointer=agent_db, run_log=lambda rec: None)
+    state, config, _ = fresh_state()
+    result = graph.invoke(state, config)
+    assert result["status"] == "refund_executed"
+    # draft + critic: free text; decide: schema-enforced
+    assert llm.response_schemas_seen == [None, None, RefundDecision]
+    decide_prompt = llm.prompts_seen[2]
+    assert "proposed_action" in decide_prompt           # schema rendered
+    assert "{{DECISION_SCHEMA}}" not in decide_prompt   # placeholder replaced
+    assert "{{MIN_CONFIDENCE}}" not in decide_prompt
 
 
 def test_deny_decision_never_calls_the_gateway(agent_db):

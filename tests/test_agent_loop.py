@@ -3,6 +3,8 @@ retries, budget metering, and prompt loading. No network, no gateway, no
 real Gemini — FakeLLM scripts the model, fake tools script the world.
 """
 
+import json
+
 import pytest
 from google.genai import types
 
@@ -417,6 +419,53 @@ def test_prompt_v4_internal_vs_external_jurisdiction():
     # v3 untouched
     assert "JURISDICTION" not in load_prompt("critic", "v3")
     assert "v4" in available_versions()
+
+
+def test_prompt_v5_gives_the_schema_it_promises():
+    """v5 (2026-11-10, first live decide_refund): the prompt said "matching
+    the schema you are given" — but NO schema was ever given; flash-lite
+    invented field names ({"decision": ...} for "proposed_action") and the
+    run schema_failed. v5 injects the rendered RefundDecision JSON schema
+    via {{DECISION_SCHEMA}} (replaced at build time, same pattern as
+    {{MIN_CONFIDENCE}}), and the graph now also enforces it at the API
+    layer via response_schema (constrained decoding)."""
+    for name in ("draft_response", "critic", "decide_refund", "loop_system"):
+        assert load_prompt(name, "v5")
+    decide = load_prompt("decide_refund", "v5")
+    assert "{{DECISION_SCHEMA}}" in decide
+    assert "Field names are mandatory" in decide
+    # older versions must not have the placeholder (their behavior is pinned;
+    # the graph's replace() is a no-op on them)
+    assert "{{DECISION_SCHEMA}}" not in load_prompt("decide_refund", "v4")
+    assert "{{DECISION_SCHEMA}}" not in load_prompt("decide_refund", "v1")
+    assert "v5" in available_versions()
+
+
+def test_to_gemini_schema_strips_everything_the_api_rejects():
+    """Live 400 (2026-11-10): handing the SDK the pydantic class made its
+    converter emit snake_case additional_properties (extra="forbid") —
+    INVALID_ARGUMENT. to_gemini_schema must produce only the supported
+    OpenAPI subset: no $defs/$ref (inlined), Optional collapsed to
+    nullable, pattern/minLength/title/additionalProperties gone, Literal
+    mapped to enum."""
+    from agent.gemini_client import to_gemini_schema
+    from agent.state import RefundDecision
+
+    schema = to_gemini_schema(RefundDecision)
+    blob = json.dumps(schema)
+    for banned in ("additionalProperties", "additional_properties", "$defs",
+                   "$ref", "pattern", "minLength", "title"):
+        assert banned not in blob
+    assert schema["type"] == "object"
+    assert "dispute_id" in schema["required"]
+    assert "issue_refund" in schema["properties"]["proposed_action"]["enum"]
+    # Optional[str] → nullable string, not anyOf
+    assert schema["properties"]["transaction_id"]["type"] == "string"
+    assert schema["properties"]["transaction_id"]["nullable"] is True
+    # nested list of CitedEvidence: $ref inlined into items
+    cited = schema["properties"]["cited_evidence"]
+    assert cited["type"] == "array"
+    assert "source" in cited["items"]["properties"]
 
 
 def test_min_confidence_env_parsing(monkeypatch):

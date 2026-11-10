@@ -78,9 +78,12 @@ class ScriptedLLM:
         self.meter = meter
         self.prompts_seen: list[str | None] = []
         self.inputs_seen: list[str] = []
+        self.response_schemas_seen: list = []
 
-    def generate(self, contents, *, system=None, tools=None, temperature=None) -> LLMResult:
+    def generate(self, contents, *, system=None, tools=None, temperature=None,
+                 response_schema=None) -> LLMResult:
         self.prompts_seen.append(system)
+        self.response_schemas_seen.append(response_schema)
         self.inputs_seen.append(str(contents))
         if not self.script:
             raise AssertionError("ScriptedLLM exhausted — graph made an extra call")

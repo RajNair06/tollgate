@@ -583,7 +583,7 @@ executed end-to-end (real refund `92F13256LW3371821`, audit rows
 ## Tests
 
 ```bash
-uv run pytest        # 239 tests, ~6 min — requires the Docker containers running
+uv run pytest        # 285 tests, ~6 min — requires the Docker containers running
 ```
 
 Runs against a real PostgreSQL test database (`tollgate_test`, created and
@@ -626,17 +626,137 @@ served assets, the no-truncation pins (wrapText/autoHeight/pre-wrap,
 ellipsis banned), and copyability (enableCellTextSelection required,
 suppressCellFocus banned).
 
+The deployment surface has its own contract suite
+(`tests/test_deploy.py`): dburl normalization (dialect rewriting +
+Supabase TLS, idempotent both ways), the root API-alive card and its
+route order against the MCP catch-all, `WORKER_IN_PROCESS` gating
+(including the deliberate decline-to-start without `AGENT_API_KEY`),
+docs-site self-containment, and the render.yaml blueprint — free plan,
+in-process worker on, every secret `sync: false`, plus a byte-scan
+proving no git-trackable file contains the production database
+password.
 
 
+
+
+## Deployment (Render + Supabase + GitHub Pages — all free tier)
+
+The reference deployment runs at $0/month. `render.yaml` at the repo root
+is the blueprint (`render up` provisions it); every secret is a
+`sync: false` entry set in the Render dashboard — nothing sensitive ever
+enters git, and `tests/test_deploy.py` enforces that.
+
+| Piece | Host | Notes |
+|---|---|---|
+| Gateway: REST + MCP + webhooks + dashboard + root card | Render **free** web service | one replica; sleeps after ~15 min idle, ~50 s cold start |
+| Outbox worker | **in-process thread** in the same service (`WORKER_IN_PROCESS=1`) | Render's free plan forbids background workers — see below |
+| PostgreSQL (gateway **and** agent tables) | Supabase **free**, session-mode pooler (port 5432, not transaction-mode 6543) | poolers can't `CREATE DATABASE`, so the agent's checkpoints + `agent_runs` share the `postgres` database; `ensure_database` sees it exists and only runs its `CREATE TABLE IF NOT EXISTS` setup — no name collisions with the 10 gateway tables |
+| Redis | Render Key Value (**free**) | `rediss://` connection string (redis-py speaks TLS natively); rate limits + PayPal token cache |
+| Docs site (`docs/index.html`) | GitHub Pages | fully static; independent of everything above |
+
+### The in-process worker, stated plainly
+
+`WORKER_IN_PROCESS=1` exists **solely to stay on Render's free plan** —
+the free tier forbids background workers. The separate
+`python -m worker` process **remains the recommended shape** (crash
+isolation, independent scaling, no shared fate with the web tier). The
+consequences: when the free service sleeps (~15 min idle, ~50 s cold
+start), the worker sleeps with it — webhook deliveries and dashboard
+traffic wake it, and PayPal retries until a delivery is accepted.
+**Correctness is unaffected** — claims are `SKIP LOCKED`, crashed leases
+are swept, dispatch is idempotent, money moves exactly once — only
+latency degrades. Keep **exactly one replica**. Migrating to a paid
+background worker later is an env change, not a code change.
+
+Missing `AGENT_API_KEY`/`GEMINI_API_KEY` makes the embedded worker log
+loudly and *decline to start* instead of crashing the web process — the
+agent key is provisioned through this service's own admin API, so
+crashing would deadlock the very first deploy.
+
+### Free-tier caveats
+
+- Supabase free projects **pause after ~1 week of inactivity** — wake
+  them from the Supabase dashboard.
+- The Supabase pooler is in **Sydney (ap-southeast-2)** while Render free
+  runs in **Oregon**: every query crosses the Pacific (~150–180 ms), so
+  multi-round-trip requests take ≈1 s. Fine for a demo; fix later by
+  co-locating regions.
+- Secrets live **only in host env vars** (the blueprint's `sync: false`
+  entries) — never committed. A test asserts the repository stays that
+  way.
+
+### Production webhook security
+
+1. In the PayPal developer dashboard, register
+   `https://<your-service>.onrender.com/webhooks/paypal` for
+   `CHECKOUT.DISPUTE.CREATED` (+ the related dispute events).
+2. Set `PAYPAL_WEBHOOK_ID` to the id PayPal returns.
+3. Leave `WEBHOOK_SHARED_SECRET` **unset** — the dev HMAC strategy then
+   fails closed (401), so only deliveries verified against PayPal's own
+   signature API (over the exact raw bytes) are ever accepted.
+   `scripts/simulate_dispute.py` therefore cannot fire at production —
+   by design.
+
+### Deploy runbook
+
+```bash
+render up    # from the repo root: provisions the web service + free KV store
+```
+
+The first deploy fails until the env vars exist — expected. In the Render
+dashboard → tollgate → Environment set:
+
+- `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`, `GEMINI_API_KEY`
+- `DATABASE_URL` **and** `AGENT_DATABASE_URL` — both the *same* Supabase
+  session-pooler string, plain `postgresql://` form (`dburl.py`
+  normalizes the scheme and appends `sslmode=require`; `WORKER_DATABASE_URL`
+  unset falls back to `DATABASE_URL`)
+- `ADMIN_API_KEY` — a **fresh** `tga_$(openssl rand -hex 24)`, not the dev key
+- `AGENT_MCP_URL=https://<your-service>.onrender.com/mcp` — ⚠️ the
+  `localhost:8000` default is wrong on Render (the app listens on
+  `$PORT`, usually 10000); the public URL hairpins fine
+- `PAYPAL_MODE=sandbox` and `WORKER_IN_PROCESS=1` come from the blueprint
+
+Manual Deploy → the build runs `uv sync --frozen` + `alembic upgrade
+head` against Supabase (through the same `dburl` normalization). Then:
+
+1. **Smoke**: `/health` → `{"status":"ok","paypal_mode":"sandbox",...}`;
+   `/` → the API-alive card; `/dashboard/` renders (approvals may show
+   the degraded `agent:null` banner until the agent tables exist —
+   designed degradation, they are created on first agent activity);
+   `/docs` loads; an MCP `initialize` POST works.
+2. **Provision the prod webhook agent**: `POST /v1/admin/agents` with
+   the fresh admin key — e.g. `{"name":"webhook-agent",
+   "allowed_actions":["refund"],"per_txn_cap":"25.00",
+   "rolling_24h_cap":"100.00","approval_threshold":"20.00"}` — save the
+   one-time `tg_…` key, set it as `AGENT_API_KEY`, redeploy. The
+   in-process worker is now active (logs: *"In-process outbox worker
+   started"*).
+3. **Register the PayPal webhook** (above) → set `PAYPAL_WEBHOOK_ID` →
+   redeploy.
+
+### GitHub Pages
+
+One manual click: repo **Settings → Pages → Build and deployment →
+Source: Deploy from a branch → Branch: `main`, folder: `/docs` →
+Save**. The site lands at <https://rajnair06.github.io/tollgate/> — the
+root card and this README both link to it. It is one self-contained HTML
+file: zero JavaScript, zero external assets, inline SVG diagrams
+(pinned by tests).
 
 ## Project layout
 
 ```
 config.py               env-driven settings (PayPal, DB, Redis, rate limits, admin key,
                         webhook id + shared secret, agent DB url)
+dburl.py                hosted-Postgres URL normalization: SQLAlchemy gets the psycopg
+                        dialect (raw psycopg never does); Supabase hosts get sslmode=require
 main.py                 FastAPI app, lifespan (PayPal client w/ Redis token cache,
-                        MCP session manager); route order: REST/admin/webhook/dashboard
-                        routers → /dashboard static mount → MCP catch-all
+                        MCP session manager, optional in-process worker); route order:
+                        REST/admin/webhook/dashboard routers → root card → /dashboard
+                        static mount → MCP catch-all
+render.yaml             Render free-tier blueprint (web service + KV Redis); every secret
+                        is sync:false — set in the dashboard, never committed
 gateway/
   paypal_client.py      PayPal REST client (pluggable TokenCache)
   models.py             the 10 tables + vocabularies + transition map
@@ -679,19 +799,25 @@ worker/
   dispatch.py           dispute_agent/resume_agent handlers, classification matrix,
                         GatewayAudit (agent_run_finished rows)
   agent_runner.py       AgentRunner: idempotent run_dispute + resume_approval w/ rails
+  inprocess.py          optional in-process worker thread (WORKER_IN_PROCESS=1 — the
+                        free-plan accommodation; the separate process stays recommended)
 dashboard/
   index.html            SPA shell: admin-key prompt, panels, degradation banners
   styles.css            dark theme; no-truncation cell CSS (pre-wrap + anywhere)
   app.js                polling client, AG Grid defs, DecisionCell, evidence/JSON renderers
   vendor/               AG Grid Community 31.3.4 (UMD + CSS, fully offline)
+docs/
+  index.html            the static docs site published via GitHub Pages: zero JS, zero
+                        external assets, inline SVG diagrams
 scripts/
   create_agent.py       CLI provisioning (prints key once)
   toll_flow.py          live PayPal sandbox end-to-end demo
   simulate_dispute.py   signed test webhook against the real endpoint (dev HMAC)
   demo_paused_run.py    seeds a [DEMO FIXTURE] paused run linked to a real approval
-tests/                  239 tests (real Postgres + MockTransport + real MCP over HTTP
+tests/                  285 tests (real Postgres + MockTransport + real MCP over HTTP
                         + scripted-LLM agent tests + cross-process resume proof
-                        + webhook/worker/dashboard suites + static contract tests)
+                        + webhook/worker/dashboard suites + static contract tests
+                        + deployment contracts)
 ```
 
 ## License

@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
+import dburl
+
 load_dotenv()
 
 # The mode selects the base URL. Sandbox and live never share credentials.
@@ -64,10 +66,10 @@ def get_settings() -> Settings:
         paypal_client_secret=client_secret,
         paypal_mode=mode,
         paypal_base_url=BASE_URLS[mode],
-        database_url=os.environ.get(
+        database_url=dburl.for_sqlalchemy(os.environ.get(
             "DATABASE_URL",
             "postgresql+psycopg://tollgate:tollgate@localhost:5433/tollgate",
-        ).strip(),
+        ).strip()),
         redis_url=os.environ.get("REDIS_URL", "redis://localhost:6380/0").strip(),
         rate_limit_per_agent_per_min=int(
             os.environ.get("RATE_LIMIT_PER_AGENT_PER_MIN", "60")
@@ -78,8 +80,8 @@ def get_settings() -> Settings:
         admin_api_key=os.environ.get("ADMIN_API_KEY", "").strip(),
         paypal_webhook_id=os.environ.get("PAYPAL_WEBHOOK_ID", "").strip(),
         webhook_shared_secret=os.environ.get("WEBHOOK_SHARED_SECRET", "").strip(),
-        agent_database_url=os.environ.get(
+        agent_database_url=dburl.for_psycopg(os.environ.get(
             "AGENT_DATABASE_URL",
             "postgresql://tollgate:tollgate@localhost:5433/agent",
-        ).strip(),
+        ).strip()),
     )

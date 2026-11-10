@@ -9,6 +9,7 @@ import os
 from dataclasses import dataclass
 
 from agent.state import MIN_CONFIDENCE_FOR_ACTION
+from dburl import for_psycopg
 
 
 def _env_unit_interval(name: str, default: float) -> float:
@@ -55,10 +56,10 @@ def get_agent_settings() -> AgentSettings:
         gemini_api_key=os.environ.get("GEMINI_API_KEY", "").strip(),
         model=os.environ.get("AGENT_MODEL", "gemini-3.8-flash").strip(),
         token_budget=int(os.environ.get("AGENT_TOKEN_BUDGET", "100000")),
-        database_url=os.environ.get(
+        database_url=for_psycopg(os.environ.get(
             "AGENT_DATABASE_URL",
             "postgresql://tollgate:tollgate@localhost:5433/agent",
-        ).strip(),
+        ).strip()),
         prompt_version=os.environ.get("AGENT_PROMPT_VERSION", "v1").strip(),
         min_confidence=_env_unit_interval(
             "AGENT_MIN_CONFIDENCE", MIN_CONFIDENCE_FOR_ACTION),

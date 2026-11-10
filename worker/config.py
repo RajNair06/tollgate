@@ -8,6 +8,8 @@ exactly one secret: the database URL where the job queue lives.
 import os
 from dataclasses import dataclass
 
+from dburl import for_sqlalchemy
+
 
 @dataclass(frozen=True)
 class WorkerSettings:
@@ -42,13 +44,13 @@ def get_worker_settings() -> WorkerSettings:
         raise ValueError(f"WORKER_MAX_ATTEMPTS must be >= 1, got {max_attempts}")
     return WorkerSettings(
         # The queue lives in the gateway database.
-        database_url=os.environ.get(
+        database_url=for_sqlalchemy(os.environ.get(
             "WORKER_DATABASE_URL",
             os.environ.get(
                 "DATABASE_URL",
                 "postgresql+psycopg://tollgate:tollgate@localhost:5433/tollgate",
             ),
-        ).strip(),
+        ).strip()),
         max_attempts=max_attempts,
         backoff_base_seconds=_positive_float("WORKER_BACKOFF_BASE_SECONDS", 2.0),
         backoff_max_seconds=_positive_float("WORKER_BACKOFF_MAX_SECONDS", 300.0),

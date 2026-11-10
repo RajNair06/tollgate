@@ -1,0 +1,47 @@
+# Render blueprint — free-tier deployment. NO secrets in this file:
+# every sync:false value is set in the Render dashboard and never enters git.
+services:
+  - type: web
+    name: tollgate
+    runtime: python
+    plan: free
+    region: oregon
+    buildCommand: "pip install uv && uv sync --frozen && uv run alembic upgrade head"
+    startCommand: "uv run uvicorn main:app --host 0.0.0.0 --port $PORT"
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12"
+      - key: PAYPAL_CLIENT_ID
+        sync: false
+      - key: PAYPAL_CLIENT_SECRET
+        sync: false
+      - key: PAYPAL_MODE
+        value: sandbox
+      - key: DATABASE_URL
+        sync: false        # Supabase session-pooler URL (plain postgresql:// form)
+      - key: AGENT_DATABASE_URL
+        sync: false        # SAME Supabase postgres database (shared — poolers can't CREATE DATABASE)
+      - key: REDIS_URL
+        fromService:
+          type: kv
+          name: tollgate-kv
+          property: connectionString
+      - key: ADMIN_API_KEY
+        sync: false        # fresh prod key: tga_$(openssl rand -hex 24)
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: AGENT_API_KEY
+        sync: false        # set AFTER first deploy provisions the webhook agent
+      - key: AGENT_MCP_URL
+        sync: false        # MUST be set: default localhost:8000 is wrong on Render (app listens on $PORT)
+      - key: PAYPAL_WEBHOOK_ID
+        sync: false        # set after registering the webhook in the PayPal dashboard
+      - key: WORKER_IN_PROCESS
+        value: "1"         # free plan has no background workers — README says this plainly
+      # WEBHOOK_SHARED_SECRET deliberately ABSENT in prod: the dev HMAC
+      # strategy then fails closed (401); only PayPal-signed events pass.
+  - type: redis
+    name: tollgate-kv
+    plan: free
+    ipAllowList: []

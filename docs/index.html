@@ -1,0 +1,836 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Toll Gate — a policy gateway between AI agents and PayPal</title>
+<meta name="description" content="Toll Gate: AI agents ask permission to move money. A policy engine decides, caps spending, requires human approval, audits everything, and holds the PayPal credentials so agents never touch money directly.">
+<!--
+  This documentation site is deliberately dependency-free:
+  no JavaScript, no CDN, no webfonts, no analytics, no API calls.
+  One HTML file, inline CSS, inline SVG. It renders identically
+  offline, from a double-click, or served from GitHub Pages — and
+  it never breaks because some service is asleep.
+-->
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0e1117;
+    --panel: #151a23;
+    --panel-2: #1a2130;
+    --border: #2a3140;
+    --text: #e6e8ee;
+    --muted: #9aa1b1;
+    --link: #7ab8ff;
+    --accent: #3ddc84;
+    --warn: #ffb454;
+    --bad: #ff6b6b;
+    --code-bg: #10141d;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.65 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  .layout { display: flex; max-width: 1280px; margin: 0 auto; }
+  nav {
+    width: 250px; flex: none; position: sticky; top: 0; align-self: flex-start;
+    height: 100vh; overflow-y: auto; padding: 28px 18px 40px 22px;
+    border-right: 1px solid var(--border);
+  }
+  nav .brand { font-size: 19px; font-weight: 700; margin-bottom: 2px; }
+  nav .brand .dot { color: var(--accent); }
+  nav .tagline { color: var(--muted); font-size: 12.5px; margin-bottom: 22px; }
+  nav a {
+    display: block; color: var(--muted); text-decoration: none;
+    padding: 5px 10px; border-radius: 7px; font-size: 14px; margin: 1px 0;
+  }
+  nav a:hover { color: var(--text); background: var(--panel); }
+  nav .ext { margin-top: 18px; border-top: 1px solid var(--border); padding-top: 12px; }
+  main { flex: 1 1 auto; min-width: 0; padding: 36px 48px 90px; }
+  section { margin-bottom: 64px; scroll-margin-top: 20px; }
+  h1 { font-size: 34px; line-height: 1.25; margin: 0 0 10px; }
+  h2 { font-size: 26px; margin: 0 0 14px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 19px; margin: 28px 0 8px; }
+  p { margin: 10px 0; }
+  a { color: var(--link); }
+  .lede { font-size: 19px; color: var(--muted); max-width: 46em; }
+  .hero-badges { margin: 18px 0 6px; }
+  .badge {
+    display: inline-block; padding: 3px 12px; margin: 0 8px 8px 0; border-radius: 999px;
+    border: 1px solid var(--border); background: var(--panel); color: var(--muted); font-size: 13px;
+  }
+  .badge b { color: var(--text); font-weight: 600; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 18px 22px; margin: 16px 0;
+  }
+  .card.note { border-left: 4px solid var(--link); }
+  .card.warn { border-left: 4px solid var(--warn); }
+  .card.good { border-left: 4px solid var(--accent); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px; overflow-x: auto; font-size: 13.5px; line-height: 1.55;
+  }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+  p code, li code, td code { background: var(--code-bg); border: 1px solid var(--border); border-radius: 5px; padding: 1px 6px; font-size: 0.92em; }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 14.5px; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: var(--panel-2); }
+  td code { white-space: nowrap; }
+  .svgwrap { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin: 18px 0; overflow-x: auto; }
+  .svgwrap svg { display: block; margin: 0 auto; max-width: 100%; height: auto; }
+  .caption { color: var(--muted); font-size: 13.5px; text-align: center; margin-top: 10px; }
+  ul.tight li, ol.tight li { margin: 5px 0; }
+  footer { color: var(--muted); font-size: 14px; border-top: 1px solid var(--border); padding-top: 20px; }
+  @media (max-width: 860px) {
+    .layout { flex-direction: column; }
+    nav { width: auto; height: auto; position: static; border-right: none;
+          border-bottom: 1px solid var(--border); padding: 18px; }
+    nav a { display: inline-block; }
+    nav .ext { border-top: none; margin-top: 6px; padding-top: 0; }
+    main { padding: 26px 20px 70px; }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+
+<nav>
+  <div class="brand"><span class="dot">●</span> Toll Gate</div>
+  <div class="tagline">AI agents ask permission.<br>The gateway decides.</div>
+  <a href="#overview">Overview</a>
+  <a href="#how">How it works</a>
+  <a href="#architecture">Architecture</a>
+  <a href="#agent">The dispute agent</a>
+  <a href="#webhook-worker">Webhook pipeline &amp; worker</a>
+  <a href="#dashboard">Admin dashboard</a>
+  <a href="#getting-started">Getting started</a>
+  <a href="#api">API reference</a>
+  <a href="#configuration">Configuration</a>
+  <a href="#deployment">Deployment</a>
+  <div class="ext">
+    <a href="https://github.com/RajNair06/tollgate">GitHub repository</a>
+    <a href="https://tollgate.onrender.com/">Live API</a>
+    <a href="https://tollgate.onrender.com/dashboard/">Live dashboard</a>
+    <a href="https://tollgate.onrender.com/docs">Live OpenAPI docs</a>
+  </div>
+</nav>
+
+<main>
+
+<!-- ================================================================ -->
+<section id="overview">
+  <h1>Toll Gate</h1>
+  <p class="lede">A policy gateway between AI agents and PayPal. Agents authenticate
+  with API keys and <em>ask permission</em> to move money. The gateway decides —
+  allow, deny, require human approval, or deduplicate — enforces spending caps
+  atomically, audits everything, and holds the PayPal credentials so agents
+  never touch money directly.</p>
+
+  <div class="hero-badges">
+    <span class="badge"><b>FastAPI</b> gateway</span>
+    <span class="badge"><b>MCP</b> server for agents</span>
+    <span class="badge"><b>LangGraph + Gemini</b> dispute agent</span>
+    <span class="badge"><b>PostgreSQL + Redis</b> state</span>
+    <span class="badge"><b>285 tests</b> against real databases</span>
+    <span class="badge"><b>MIT</b> licensed</span>
+  </div>
+
+  <h3>The problem</h3>
+  <p>Autonomous agents are good at deciding <em>what</em> to do and bad at being
+  trusted with <em>doing it</em>. Give an LLM a PayPal credential and a refund
+  endpoint, and one hallucinated justification moves real money. Toll Gate
+  separates the two roles:</p>
+  <div class="grid2">
+    <div class="card">
+      <b>The agent proposes.</b>
+      <p style="margin-bottom:0">It authenticates with its own key, states an
+      action, an amount, and an idempotency key. That is a <em>request</em>,
+      not a capability — it cannot execute anything itself.</p>
+    </div>
+    <div class="card">
+      <b>The gateway disposes.</b>
+      <p style="margin-bottom:0">A policy engine checks the agent's allowlist,
+      per-transaction cap, rolling 24-hour cap, and approval threshold — under
+      a row lock, in one transaction — and only then (maybe) calls PayPal.</p>
+    </div>
+  </div>
+
+  <h3>What is in the box</h3>
+  <ul class="tight">
+    <li><b>Policy engine</b> — agent identity, per-agent policies, atomic spending caps, an approval state machine, and an append-only audit log.</li>
+    <li><b>PayPal client</b> — OAuth2 with cached tokens, orders, captures, refunds, disputes; deterministic <code>PayPal-Request-Id</code> idempotency so retries can never double-refund.</li>
+    <li><b>MCP server</b> — the same gateway exposed to agents as Model Context Protocol tools over streamable HTTP at <code>/mcp</code>. Money-moving tools run the full policy engine first.</li>
+    <li><b>Dispute agent</b> — an autonomous LangGraph agent that gathers evidence, drafts a response, fact-checks itself with a critic, and proposes a schema-validated refund. It talks to the gateway <em>only</em> through MCP, like any other agent.</li>
+    <li><b>Webhook pipeline + outbox worker</b> — PayPal dispute webhooks are verified, persisted, and enqueued in one transaction; a worker claims jobs and runs (or resumes) the agent, with retries, backoff, and a dead-letter queue.</li>
+    <li><b>Admin dashboard</b> — a static, offline-capable single-page app at <code>/dashboard/</code>: live approvals with the agent's reasoning and cited evidence, one-click approve/reject, actions, audit feed, metrics, and dead letters. Nothing is ever truncated.</li>
+  </ul>
+
+  <div class="card note">
+    <b>About this site.</b> These docs are one self-contained HTML file — no
+    JavaScript, no CDN, no API calls. They stay up and accurate regardless of
+    whether any Toll Gate service is running. The live links in the sidebar
+    are just links; everything you need to understand and run the system is
+    on this page.
+  </div>
+</section>
+
+<!-- ================================================================ -->
+<section id="how">
+  <h2>How it works</h2>
+
+  <h3>Every request gets a verdict</h3>
+  <p>An agent posts an action (today: <code>refund</code>, <code>create_order</code>)
+  with an amount and an idempotency key. The engine returns exactly one of four
+  outcomes — always HTTP 200, because a denial is a successful <em>answer</em>,
+  not an error:</p>
+  <table>
+    <tr><th>Outcome</th><th>Meaning</th><th>Money</th></tr>
+    <tr><td><code>allowed</code></td><td>Within policy. The gateway executes the call on PayPal.</td><td>Moves now</td></tr>
+    <tr><td><code>pending_approval</code></td><td>Amount ≥ the agent's approval threshold. An approval row is created and waits for a human.</td><td>Reserved, not moved</td></tr>
+    <tr><td><code>denied</code></td><td>Action not in the agent's allowlist, or a cap is exceeded.</td><td>Never</td></tr>
+    <tr><td><code>deduplicated</code></td><td>The idempotency key was already used by this agent. The original verdict is replayed.</td><td>Never twice</td></tr>
+  </table>
+
+  <h3>Caps are atomic, even under concurrency</h3>
+  <p>The engine takes <code>SELECT … FOR UPDATE</code> on the agent row first:
+  concurrent requests from one agent serialize, while different agents never
+  block each other. The rolling 24-hour cap counts committed <code>allowed</code>
+  actions <em>plus</em> live <code>pending_approval</code> ones — a pending
+  approval reserves headroom; rejecting or expiring it releases the headroom.
+  A partial unique index on <code>(agent_id, idempotency_key)</code> makes
+  double-spending the same key physically impossible at the database level.
+  This is not a claim, it is a test: 50 barrier-aligned threads race $10
+  actions against a $100 cap, and exactly ten win — total exactly $100.00.</p>
+
+  <h3>Approvals are a state machine with a human in the loop</h3>
+  <p><code>pending → approved → executed</code>, with <code>rejected</code>,
+  <code>expired</code>, and <code>failed</code> as exits. CHECK constraints
+  enforce timeline consistency; illegal transitions return 409. Executing an
+  approved refund carries a deterministic <code>PayPal-Request-Id</code>
+  derived from the action id, so even a replayed execution cannot refund twice.</p>
+
+  <h3>Every decision is written down, in one transaction</h3>
+  <p>A decision writes four rows atomically — the action, an audit entry, an
+  immutable domain event, and an outbox row for relays. All land or none do.
+  The audit log is append-only and records auth failures too, so an attacker
+  probing keys leaves the same kind of trail as an agent working normally.</p>
+</section>
+
+<!-- ================================================================ -->
+<section id="architecture">
+  <h2>Architecture</h2>
+  <p>One FastAPI process serves every doorway: REST for agents, MCP for
+  tool-calling agents, a signature-verified webhook door for PayPal, and the
+  static dashboard for operators. On Render's free plan the outbox worker runs
+  as a thread inside the same process (see <a href="#deployment">Deployment</a>);
+  everywhere else it is a separate <code>python -m worker</code> process. The
+  agent's checkpoints and run telemetry live in their own database, so the
+  gateway schema never grows foreign keys into data another process owns.</p>
+
+  <div class="svgwrap">
+  <svg viewBox="0 0 960 560" role="img" aria-label="System architecture diagram">
+    <defs>
+      <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#7ab8ff"/>
+      </marker>
+    </defs>
+    <style>
+      .box { fill: #1b2230; stroke: #3a4356; }
+      .ext { fill: #141a26; stroke: #33405a; }
+      .db  { fill: #16241c; stroke: #2f5540; }
+      .t   { fill: #e6e8ee; font: 600 13px system-ui, sans-serif; }
+      .s   { fill: #9aa1b1; font: 11.5px system-ui, sans-serif; }
+      .l   { fill: #9aa1b1; font: 11px system-ui, sans-serif; }
+      .a   { stroke: #7ab8ff; stroke-width: 1.6; fill: none; marker-end: url(#arr); }
+    </style>
+
+    <!-- band 1: agent traffic — doors → policy engine → PayPal -->
+    <rect class="ext" x="20" y="40" width="150" height="52" rx="9"/>
+    <text class="t" x="34" y="57">AI agents /</text>
+    <text class="t" x="34" y="72">MCP clients</text>
+    <text class="s" x="34" y="87">tg_ API keys</text>
+
+    <rect class="box" x="210" y="40" width="170" height="52" rx="9"/>
+    <text class="t" x="244" y="62">Doors</text>
+    <text class="s" x="244" y="80">REST /v1 · MCP /mcp</text>
+
+    <rect class="box" x="420" y="40" width="190" height="52" rx="9"/>
+    <text class="t" x="434" y="62">Policy engine</text>
+    <text class="s" x="434" y="80">lock → dedup → caps → threshold</text>
+
+    <rect class="box" x="650" y="40" width="130" height="52" rx="9"/>
+    <text class="t" x="664" y="62">PayPal client</text>
+    <text class="s" x="664" y="80">OAuth · idempotent</text>
+
+    <rect class="ext" x="820" y="40" width="120" height="52" rx="9"/>
+    <text class="t" x="834" y="62">PayPal API</text>
+    <text class="s" x="834" y="80">sandbox / live</text>
+
+    <path class="a" d="M170,66 H210"/>
+    <text class="l" x="172" y="58">authenticate</text>
+    <path class="a" d="M380,66 H420"/>
+    <path class="a" d="M610,66 H650"/>
+    <text class="l" x="612" y="58">allowed</text>
+    <path class="a" d="M780,66 H820"/>
+
+    <rect class="db" x="210" y="150" width="170" height="52" rx="9"/>
+    <text class="t" x="224" y="172">Redis</text>
+    <text class="s" x="224" y="190">rate limits · token cache</text>
+    <path class="a" d="M295,92 V150"/>
+
+    <rect class="db" x="420" y="150" width="190" height="64" rx="9"/>
+    <text class="t" x="434" y="172">PostgreSQL</text>
+    <text class="s" x="434" y="190">actions · approvals · audit</text>
+    <text class="s" x="434" y="206">events · webhook queue</text>
+    <path class="a" d="M515,92 V150"/>
+    <text class="l" x="522" y="140">one transaction</text>
+
+    <!-- band 2: webhook pipeline — door → queue → worker → agent -->
+    <rect class="ext" x="20" y="270" width="150" height="52" rx="9"/>
+    <text class="t" x="34" y="292">PayPal</text>
+    <text class="s" x="34" y="310">dispute webhooks</text>
+
+    <rect class="box" x="210" y="270" width="170" height="52" rx="9"/>
+    <text class="t" x="224" y="292">Webhook door</text>
+    <text class="s" x="224" y="310">verify → persist → enqueue</text>
+
+    <path class="a" d="M170,296 H210"/>
+    <text class="l" x="172" y="288">signed</text>
+    <path class="a" d="M380,296 H404 V200 H420"/>
+
+    <rect class="box" x="470" y="270" width="170" height="52" rx="9"/>
+    <text class="t" x="484" y="292">Outbox worker</text>
+    <text class="s" x="484" y="310">claims · runs · resumes</text>
+    <path class="a" d="M505,214 V270"/>
+    <text class="l" x="512" y="245">SKIP LOCKED</text>
+
+    <rect class="box" x="700" y="270" width="170" height="52" rx="9"/>
+    <text class="t" x="714" y="292">Dispute agent</text>
+    <text class="s" x="714" y="310">LangGraph + Gemini</text>
+    <path class="a" d="M640,296 H700"/>
+
+    <path class="a" d="M785,270 V120 H340 V92"/>
+    <text class="l" x="352" y="112">agent calls MCP tools</text>
+
+    <rect class="db" x="700" y="380" width="190" height="64" rx="9"/>
+    <text class="t" x="714" y="402">Agent DB</text>
+    <text class="s" x="714" y="420">checkpoints</text>
+    <text class="s" x="714" y="436">agent_runs telemetry</text>
+    <path class="a" d="M785,322 V380"/>
+
+    <!-- band 3: operator — dashboard reads and decides -->
+    <rect class="ext" x="20" y="450" width="150" height="52" rx="9"/>
+    <text class="t" x="34" y="480">Operator browser</text>
+
+    <rect class="box" x="210" y="450" width="200" height="52" rx="9"/>
+    <text class="t" x="244" y="472">Dashboard</text>
+    <text class="s" x="244" y="490">static SPA + /v1/admin/*</text>
+
+    <path class="a" d="M170,476 H210"/>
+    <text class="l" x="172" y="468">X-Admin-Key</text>
+    <path class="a" d="M410,476 H430 V214"/>
+    <text class="l" x="215" y="442">reads · decisions + resume (1 txn)</text>
+    <path class="a" d="M410,490 H790 V444"/>
+    <text class="l" x="500" y="484">reads reasoning</text>
+  </svg>
+  <div class="caption">One FastAPI process serves every door. On Render's free
+  plan the outbox worker runs in-process (a daemon thread); everywhere else it
+  is a separate <code>python -m worker</code> process.</div>
+  </div>
+
+  <h3>Trust boundaries</h3>
+  <ul class="tight">
+    <li><b>Agents never hold PayPal credentials.</b> The gateway owns them; agents own a revocable <code>tg_…</code> key with a policy attached.</li>
+    <li><b>The dispute agent never touches the gateway's database.</b> Its only doorway is MCP, so its refunds pass the same caps and audit as anyone else's.</li>
+    <li><b>The worker never holds PayPal credentials either.</b> Its single secret is the queue database URL; its agent identity is a regular key.</li>
+    <li><b>The admin key is a deployment secret</b> (environment variable), never an agent key — agents cannot provision or approve as admins.</li>
+    <li><b>Webhook identity is the signature.</b> In production only PayPal's own verification API can admit an event; unverifiable deliveries are rejected (PayPal retries).</li>
+  </ul>
+</section>
+
+<!-- ================================================================ -->
+<section id="agent">
+  <h2>The dispute agent</h2>
+  <p>An autonomous LangGraph agent that handles a PayPal dispute end to end:
+  gather evidence through MCP reads, have Gemini draft a response, fact-check
+  the draft with a critic, emit a schema-validated refund decision, and request
+  the refund through the gateway. If the gateway demands human approval, the
+  graph <em>pauses durably</em> — the state is checkpointed in PostgreSQL and
+  the process can die; a fresh process resumes by thread id after the decision.</p>
+
+  <div class="svgwrap">
+  <svg viewBox="0 0 760 660" role="img" aria-label="Dispute agent graph">
+    <defs>
+      <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#7ab8ff"/>
+      </marker>
+      <marker id="arr2r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#ff6b6b"/>
+      </marker>
+    </defs>
+    <style>
+      .n   { fill: #1b2230; stroke: #3a4356; }
+      .nh  { fill: #1d2636; stroke: #4a5a7a; }
+      .term{ fill: #241a1d; stroke: #5a3a40; }
+      .ok  { fill: #16241c; stroke: #2f5540; }
+      .t   { fill: #e6e8ee; font: 600 13px system-ui, sans-serif; }
+      .s   { fill: #9aa1b1; font: 11.5px system-ui, sans-serif; }
+      .a   { stroke: #7ab8ff; stroke-width: 1.6; fill: none; marker-end: url(#arr2); }
+      .ar  { stroke: #ff6b6b; stroke-width: 1.5; fill: none; marker-end: url(#arr2r); }
+      .l   { fill: #9aa1b1; font: 11px system-ui, sans-serif; }
+    </style>
+
+    <rect class="n" x="280" y="20" width="200" height="48" rx="8"/>
+    <text class="t" x="296" y="40">gather_evidence</text>
+    <text class="s" x="296" y="57">MCP reads — no LLM</text>
+
+    <rect class="n" x="280" y="112" width="200" height="48" rx="8"/>
+    <text class="t" x="296" y="132">draft_response</text>
+    <text class="s" x="296" y="149">Gemini drafts from evidence</text>
+
+    <rect class="n" x="280" y="204" width="200" height="48" rx="8"/>
+    <text class="t" x="296" y="224">critic</text>
+    <text class="s" x="296" y="241">regex scan + LLM fact-check</text>
+
+    <rect class="n" x="280" y="296" width="200" height="48" rx="8"/>
+    <text class="t" x="296" y="316">decide_refund</text>
+    <text class="s" x="296" y="333">Pydantic RefundDecision</text>
+
+    <rect class="nh" x="280" y="388" width="200" height="48" rx="8"/>
+    <text class="t" x="296" y="408">request_refund</text>
+    <text class="s" x="296" y="425">MCP issue_refund → policy engine</text>
+
+    <rect class="ok" x="280" y="490" width="200" height="48" rx="8"/>
+    <text class="t" x="296" y="510">finalize</text>
+    <text class="s" x="296" y="527">telemetry → agent_runs</text>
+
+    <rect class="ok" x="280" y="586" width="200" height="42" rx="8"/>
+    <text class="s" x="296" y="612">refund executed · run finished</text>
+
+    <!-- pause branch -->
+    <rect class="nh" x="530" y="382" width="200" height="60" rx="8"/>
+    <text class="t" x="546" y="403">execute_refund</text>
+    <text class="s" x="546" y="420">interrupt() — checkpointed</text>
+    <text class="s" x="546" y="434">in PostgreSQL, process can die</text>
+
+    <rect class="nh" x="530" y="490" width="200" height="48" rx="8"/>
+    <text class="t" x="546" y="510">human decides</text>
+    <text class="s" x="546" y="527">dashboard approve / reject</text>
+
+    <!-- terminals -->
+    <rect class="term" x="20" y="26" width="190" height="36" rx="8"/>
+    <text class="s" x="36" y="49">evidence_failed — run ends</text>
+
+    <rect class="term" x="20" y="210" width="190" height="36" rx="8"/>
+    <text class="s" x="36" y="226">rejected_by_critic</text>
+    <text class="s" x="36" y="241" style="font-size:10px">(one pass, never reworded)</text>
+
+    <rect class="term" x="20" y="302" width="190" height="36" rx="8"/>
+    <text class="s" x="36" y="325">schema_failed — run ends</text>
+
+    <rect class="term" x="530" y="586" width="200" height="42" rx="8"/>
+    <text class="s" x="546" y="604">rejected →</text>
+    <text class="s" x="546" y="619">refund_not_approved</text>
+
+    <!-- arrows -->
+    <path class="a" d="M380,68 V112"/>
+    <path class="a" d="M380,160 V204"/>
+    <path class="a" d="M380,252 V296"/>
+    <text class="l" x="390" y="280">pass</text>
+    <path class="a" d="M380,344 V388"/>
+    <text class="l" x="390" y="372">valid</text>
+    <path class="a" d="M380,436 V490"/>
+    <text class="l" x="390" y="468">allowed</text>
+    <path class="a" d="M380,538 V586"/>
+
+    <path class="a" d="M480,412 H530"/>
+    <text class="l" x="486" y="378">pending_approval</text>
+    <path class="a" d="M630,442 V490"/>
+    <path class="a" d="M585,538 V560 H380 V538"/>
+    <text class="l" x="390" y="554">approved: resume → execute_approved_refund</text>
+    <path class="a" d="M630,538 V586"/>
+    <text class="l" x="640" y="566">rejected</text>
+
+    <path class="ar" d="M280,44 H210"/>
+    <text class="l" x="238" y="38">error</text>
+    <path class="ar" d="M280,228 H210"/>
+    <text class="l" x="238" y="222">fail</text>
+    <path class="ar" d="M280,320 H210"/>
+    <text class="l" x="238" y="314">invalid</text>
+  </svg>
+  <div class="caption">The graph only moves forward. Every failure branch is
+  terminal, and only a human approval can wake <code>execute_refund</code>.</div>
+  </div>
+
+  <h3>Anti-hallucination guards</h3>
+  <ul class="tight">
+    <li><b>One-pass critic, no revision loop.</b> Every 17-character-ID-shaped and timestamp-shaped token in the draft must appear verbatim in the evidence JSON (a deterministic scan), and an LLM fact-check verdict must say <code>supported</code> — unparseable verdicts fail closed. A rejected draft <em>ends the run</em>; it is never sent back for rewording, so a hallucination cannot be laundered by a rewrite.</li>
+    <li><b>The decision is a schema, not prose.</b> <code>RefundDecision</code> forbids extra fields, enforces the gateway's ID and timestamp formats, requires cited transaction IDs to exist in the evidence, caps the refund at the transaction amount, and forces <code>escalate_human</code> when confidence is below the floor (default 0.6).</li>
+    <li><b>Money never trusts the prose.</b> Whatever the reasoning says, execution passes the policy engine, caps, and — above the threshold — a human. The reasoning exists so the human can ask "is this real?" before approving.</li>
+  </ul>
+
+  <h3>Budgets, retries, telemetry</h3>
+  <p>Each run gets a <code>RunMeter</code>: a unique run id, a hard token
+  budget checked <em>before</em> every call, and USD cost from a static price
+  table. Transient Gemini failures (429, 5xx, network) retry with exponential
+  backoff plus jitter; 4xx errors never retry. Every run upserts an
+  <code>agent_runs</code> row — status, tokens in/out, cost, LLM calls,
+  confidence, proposed action — which doubles as the calibration dataset for
+  the confidence floor. When a run pauses for approval, a provisional row is
+  written immediately carrying the <em>full</em> decision (reasoning and cited
+  evidence), so the dashboard can show what the agent was thinking while it
+  waits.</p>
+</section>
+
+<!-- ================================================================ -->
+<section id="webhook-worker">
+  <h2>Webhook pipeline &amp; outbox worker</h2>
+  <p>PayPal dispute webhooks arrive at <code>POST /webhooks/paypal</code>.
+  The endpoint's contract: answer 200 fast, and never do work inline that can
+  be done later. Verification, persistence, and job enqueue happen in one
+  transaction; running the agent is the worker's job.</p>
+
+  <div class="svgwrap">
+  <svg viewBox="0 0 940 290" role="img" aria-label="Webhook to refund pipeline">
+    <defs>
+      <marker id="arr3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#7ab8ff"/>
+      </marker>
+    </defs>
+    <style>
+      .n { fill: #1b2230; stroke: #3a4356; }
+      .h { fill: #1d2636; stroke: #4a5a7a; }
+      .g { fill: #16241c; stroke: #2f5540; }
+      .t { fill: #e6e8ee; font: 600 12.5px system-ui, sans-serif; }
+      .s { fill: #9aa1b1; font: 11px system-ui, sans-serif; }
+      .a { stroke: #7ab8ff; stroke-width: 1.6; fill: none; marker-end: url(#arr3); }
+      .l { fill: #9aa1b1; font: 10.5px system-ui, sans-serif; }
+    </style>
+
+    <rect class="n" x="20" y="30" width="170" height="52" rx="8"/>
+    <text class="t" x="34" y="51">PayPal webhook</text>
+    <text class="s" x="34" y="68">CHECKOUT.DISPUTE.CREATED</text>
+
+    <rect class="n" x="250" y="30" width="180" height="52" rx="8"/>
+    <text class="t" x="264" y="51">Verify → persist →</text>
+    <text class="t" x="264" y="67">enqueue</text>
+    <text class="s" x="352" y="51">one txn</text>
+
+    <rect class="h" x="490" y="30" width="170" height="52" rx="8"/>
+    <text class="t" x="504" y="51">webhook_outbox</text>
+    <text class="s" x="504" y="68">job queue in PostgreSQL</text>
+
+    <rect class="h" x="720" y="30" width="200" height="52" rx="8"/>
+    <text class="t" x="734" y="51">Worker claims job</text>
+    <text class="s" x="734" y="68">FOR UPDATE SKIP LOCKED</text>
+
+    <rect class="n" x="720" y="140" width="200" height="56" rx="8"/>
+    <text class="t" x="734" y="161">Agent run pauses</text>
+    <text class="s" x="734" y="178">checkpoint + provisional row</text>
+    <text class="s" x="734" y="191">linked to the approval</text>
+
+    <rect class="n" x="450" y="140" width="200" height="56" rx="8"/>
+    <text class="t" x="464" y="161">Human decides</text>
+    <text class="s" x="464" y="178">dashboard approve / reject →</text>
+    <text class="s" x="464" y="191">resume job, same transaction</text>
+
+    <rect class="n" x="190" y="140" width="190" height="56" rx="8"/>
+    <text class="t" x="204" y="161">Worker resumes</text>
+    <text class="s" x="204" y="178">checkpoint → refund via MCP</text>
+    <text class="s" x="204" y="191">money moves exactly once</text>
+
+    <rect class="g" x="20" y="140" width="130" height="56" rx="8"/>
+    <text class="t" x="34" y="161">Audited</text>
+    <text class="s" x="34" y="178">agent_run_finished</text>
+    <text class="s" x="34" y="191">+ refund rows</text>
+
+    <path class="a" d="M190,56 H250"/>
+    <path class="a" d="M430,56 H490"/>
+    <path class="a" d="M660,56 H720"/>
+    <path class="a" d="M820,82 V140"/>
+    <text class="l" x="828" y="116">pending_approval</text>
+    <path class="a" d="M720,168 H650"/>
+    <path class="a" d="M450,168 H380"/>
+    <path class="a" d="M190,168 H150"/>
+
+    <text class="s" x="20" y="240">Failures: transient errors retry with exponential backoff × jitter (up to 5 attempts);</text>
+    <text class="s" x="20" y="258">permanent errors dead-letter immediately — both keep their full error text for the dashboard's dead-letter panel.</text>
+    <text class="s" x="20" y="276">Duplicate deliveries are absorbed twice over: a UNIQUE external event id, and a partial unique index on (job_type, dedup_key).</text>
+  </svg>
+  <div class="caption">Webhook → queue → agent → pause → human → resume → refund,
+  with every arrow crash-safe.</div>
+  </div>
+
+  <h3>The guarantees, one by one</h3>
+  <ul class="tight">
+    <li><b>Fail-closed verification.</b> Production deliveries are checked against PayPal's <code>verify-webhook-signature</code> API using the raw bytes; if the verifier is unreachable the delivery is rejected (502) — an unverifiable event is not an accepted event. A dev HMAC strategy exists for the simulator and fails closed when unconfigured.</li>
+    <li><b>At-least-once dispatch is safe.</b> The run id equals the checkpoint thread id equals <code>webhook-{dispute_id}</code>. A redelivered job finds the finished thread and no-ops.</li>
+    <li><b>Claims never block work.</b> The claim is a short <code>SKIP LOCKED</code> transaction; handlers run outside it, so a slow LLM call holds no row locks.</li>
+    <li><b>Classification defaults to retryable.</b> Only explicitly permanent errors (bad evidence, schema failure, critic rejection, budget exhaustion, and the resume rails) dead-letter immediately; anything ambiguous retries with backoff.</li>
+    <li><b>Crashed workers don't strand jobs.</b> A lease sweep reclaims <code>processing</code> rows whose claim is older than the lease, or dead-letters them if attempts are spent.</li>
+    <li><b>Deciding an approval and waking the agent are atomic.</b> The admin decision endpoint writes the decision and enqueues the resume job in the same transaction — a decision can never be recorded without the agent being eventually resumed.</li>
+    <li><b>Money moves once.</b> Resume rails verify the run exists, is paused, and matches the approval; a redelivered resume records the outcome without re-executing; the refund itself rides the gateway's deterministic request id.</li>
+  </ul>
+</section>
+
+<!-- ================================================================ -->
+<section id="dashboard">
+  <h2>Admin dashboard</h2>
+  <p>A static single-page app served by the gateway at <code>/dashboard/</code>,
+  built on AG Grid Community — <b>vendored, not CDN-loaded</b> (fonts included
+  as data URIs), so the page itself never reaches the network for anything but
+  its JSON APIs. First load prompts for the admin key, stored in localStorage
+  and sent as <code>X-Admin-Key</code>; a 401 re-prompts.</p>
+
+  <h3>Panels</h3>
+  <ul class="tight">
+    <li><b>Approvals</b> (full width, top) — pending approvals joined with the paused agent run: confidence, the full reasoning text, and every piece of cited evidence. One-click Approve/Reject opens a confirm dialog that names the amount and warns that approving executes a real refund; the operator identity is asked once and remembered.</li>
+    <li><b>Actions</b> and <b>Audit</b> — side by side, filterable, with full detail JSON.</li>
+    <li><b>Dead letter</b> — failed jobs with their complete error text, stack traces included.</li>
+    <li><b>Metrics</b> — counters, money totals, median decision latency, agent-run status mix.</li>
+  </ul>
+  <p>All panels poll every two seconds (ticks never overlap) and diff by row id,
+  so live updates don't flicker or reset your scroll position.</p>
+
+  <h3>The no-truncation contract</h3>
+  <div class="card good">
+    <b>Nothing is ever cut off.</b> Every column wraps
+    (<code>wrapText</code> + <code>autoHeight</code>); cells force
+    <code>pre-wrap</code> and <code>overflow-wrap: anywhere</code>, so a
+    1,300-character reasoning paragraph, a multiline stack trace, a 240-character
+    unbroken token, and a 1.8&nbsp;KB JSON blob all wrap <em>inside the cell</em>
+    — the row grows instead. The word "ellipsis" is banned from the HTML, CSS,
+    and JS by a test, and cell text is pinned selectable/copyable
+    (<code>enableCellTextSelection</code> required,
+    <code>suppressCellFocus</code> banned). Timestamps render on two lines.
+    A contract test fails the build if any of this regresses.
+  </div>
+
+  <h3>Graceful degradation</h3>
+  <p>The dashboard APIs join two databases (gateway rows + agent reasoning) in
+  application code. If the agent database is unreachable, approval rows degrade
+  to <code>agent: null</code> and the page shows a banner — the approvals list
+  itself never fails because a secondary store is down.</p>
+</section>
+
+<!-- ================================================================ -->
+<section id="getting-started">
+  <h2>Getting started</h2>
+
+  <h3>Prerequisites</h3>
+  <ul class="tight">
+    <li>Python ≥ 3.12 and <a href="https://docs.astral.sh/uv/">uv</a></li>
+    <li>Docker (PostgreSQL 16 + Redis 7) for local state</li>
+    <li>PayPal sandbox credentials from <a href="https://developer.paypal.com">developer.paypal.com</a></li>
+    <li>A Gemini API key for the dispute agent</li>
+  </ul>
+
+  <h3>1 · Infrastructure</h3>
+<pre><code>docker run -d --name tollgate-pg -e POSTGRES_USER=tollgate -e POSTGRES_PASSWORD=tollgate \
+  -e POSTGRES_DB=tollgate -p 5433:5432 postgres:16-alpine
+docker run -d --name tollgate-redis -p 6380:6379 redis:7-alpine</code></pre>
+  <p>Ports 5433/6380 avoid the native services that often own 5432/6379 on dev
+  machines. The agent's own database is created and migrated automatically on
+  first use.</p>
+
+  <h3>2 · Application</h3>
+<pre><code>git clone https://github.com/RajNair06/tollgate.git
+cd tollgate
+uv sync
+cp .env.example .env    # fill PayPal creds; ADMIN_API_KEY: tga_$(openssl rand -hex 24)
+uv run alembic upgrade head
+uv run uvicorn main:app --port 8000     # terminal 1: gateway + MCP + webhooks + dashboard
+uv run python -m worker                 # terminal 2: outbox worker</code></pre>
+
+  <h3>3 · Provision an agent</h3>
+<pre><code>curl -s -X POST localhost:8000/v1/admin/agents \
+  -H "X-Admin-Key: $ADMIN_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"name":"refund-bot","allowed_actions":["refund"],
+       "per_txn_cap":"25.00","rolling_24h_cap":"100.00","approval_threshold":"20.00"}'
+# → {"agent_id":1,"api_key":"tg_...","key_id":1,...}   (the key is shown ONCE)</code></pre>
+
+  <h3>4 · Ask for a decision</h3>
+<pre><code>curl -s -X POST localhost:8000/v1/agent-actions \
+  -H "X-API-Key: tg_..." -H 'Content-Type: application/json' \
+  -d '{"action_type":"refund","amount":"22.00","idempotency_key":"req-0001"}'
+# → {"outcome":"pending_approval","reason_code":"APPROVAL_REQUIRED","approval_id":1,...}
+# replaying the same idempotency_key → {"outcome":"deduplicated",...}</code></pre>
+  <p>Amounts are decimal <b>strings</b> — JSON numbers are rejected. All four
+  verdicts return HTTP 200; 4xx always means the <em>request</em> failed.</p>
+
+  <h3>5 · Try the webhook pipeline</h3>
+<pre><code># fires a signed dispute event at the real endpoint (dev HMAC strategy)
+WEBHOOK_SHARED_SECRET=dev-shared-secret uv run python scripts/simulate_dispute.py</code></pre>
+  <p>The simulated dispute does not exist in the sandbox, so the dispatched run
+  fails fast with a real <code>RESOURCE_NOT_FOUND</code> and lands in the
+  dead-letter panel — the failure path, demonstrated live.</p>
+
+  <h3>6 · Demo the full approve → resume → refund loop</h3>
+  <p>The sandbox cannot generate real disputes, so a seeder script bridges the
+  gap: create a real pending approval (step 4 against a real sandbox capture),
+  then</p>
+<pre><code>uv run python scripts/demo_paused_run.py --approval-id 6 --action-id 70 \
+    --dispute-id PP-D-90002</code></pre>
+  <p>This runs the <em>real</em> graph, checkpointer, and runner against a
+  <em>scripted</em> world. Its reasoning text is hand-written fixture prose and
+  says so: it opens with "[DEMO FIXTURE — synthetic text, not model output]".
+  Open the dashboard, click Approve, and the worker resumes the checkpoint and
+  executes a real sandbox refund.</p>
+
+  <h3>7 · Open the dashboard</h3>
+  <p><code>http://localhost:8000/dashboard/</code> — paste your
+  <code>ADMIN_API_KEY</code> at the prompt.</p>
+
+  <h3>Run the tests</h3>
+<pre><code>uv run pytest        # 285 tests, ~6 min — needs the Docker containers</code></pre>
+  <p>Tests run against real PostgreSQL (serialization, unique indexes, CHECK
+  constraints, checkpointing, queue mechanics are database behavior, so mocks
+  would prove nothing). The PayPal client is tested offline via mock transport;
+  the MCP server is tested end-to-end over real streamable HTTP.</p>
+</section>
+
+<!-- ================================================================ -->
+<section id="api">
+  <h2>API reference</h2>
+  <p>The live, interactive version of this reference is OpenAPI/Swagger at
+  <code>/docs</code> on any running instance. Summary:</p>
+
+  <h3>Agent-facing — auth <code>X-API-Key</code> or <code>Authorization: Bearer</code></h3>
+  <table>
+    <tr><th>Endpoint</th><th>Purpose</th></tr>
+    <tr><td><code>POST /v1/agent-actions</code></td><td>The decision endpoint (allow / deny / pending_approval / deduplicated, all HTTP 200)</td></tr>
+    <tr><td><code>GET /v1/actions/{id}</code></td><td>Action detail (own agent only)</td></tr>
+    <tr><td><code>GET /v1/approvals/{id}</code></td><td>Approval + action detail</td></tr>
+    <tr><td><code>POST /v1/approvals/{id}/decision</code></td><td>approve / reject (illegal transitions → 409)</td></tr>
+    <tr><td><code>POST /v1/approvals/{id}/execute</code></td><td>Record execution result</td></tr>
+    <tr><td><code>GET /health</code></td><td>Liveness + PayPal mode + version</td></tr>
+  </table>
+
+  <h3>MCP tools — <code>/mcp</code>, streamable HTTP, same agent key</h3>
+  <table>
+    <tr><th>Tool</th><th>Policy</th><th>Purpose</th></tr>
+    <tr><td><code>get_transaction</code></td><td>identity</td><td>Fetch a capture by its 17-char id</td></tr>
+    <tr><td><code>list_disputes</code> / <code>get_dispute</code></td><td>identity</td><td>Dispute reads</td></tr>
+    <tr><td><code>issue_refund</code></td><td><b>full engine</b></td><td>Refund a capture; <code>allowed</code> executes immediately with a deterministic request id</td></tr>
+    <tr><td><code>create_order</code></td><td><b>full engine</b></td><td>Create an order (no money moves)</td></tr>
+    <tr><td><code>execute_approved_refund</code></td><td>approval machine</td><td>Execute a human-approved refund; replays return the recorded outcome</td></tr>
+  </table>
+  <p>MCP client configuration for any compatible harness:</p>
+<pre><code>{"mcpServers": {"tollgate": {
+  "url": "http://localhost:8000/mcp",
+  "headers": {"Authorization": "Bearer tg_..."}}}}</code></pre>
+
+  <h3>Webhook — no agent auth; the signature is the identity</h3>
+  <table>
+    <tr><th>Endpoint</th><th>Purpose</th></tr>
+    <tr><td><code>POST /webhooks/paypal</code></td><td>Verified event intake. Production: PayPal's verification API (fail-closed 502 when unreachable). Dev: <code>X-Tollgate-Signature</code> HMAC. Bad signature 401, malformed 400, unconfigured 503</td></tr>
+  </table>
+
+  <h3>Admin — auth <code>X-Admin-Key</code></h3>
+  <table>
+    <tr><th>Endpoint</th><th>Purpose</th></tr>
+    <tr><td><code>POST /v1/admin/agents</code></td><td>Provision agent + policy + first key (plaintext key shown once)</td></tr>
+    <tr><td><code>PATCH /v1/admin/agents/{id}</code></td><td>Kill switch and/or policy fields, with audited before/after diff</td></tr>
+    <tr><td><code>POST /v1/admin/agents/{id}/keys</code> · <code>DELETE /v1/admin/keys/{key_id}</code></td><td>Key rotation (issue additional / soft-revoke)</td></tr>
+    <tr><td><code>GET /v1/admin/agents[/{id}]</code></td><td>Ops views (key prefixes, never hashes)</td></tr>
+    <tr><td><code>POST /v1/admin/approvals/{id}/decision</code></td><td>The dashboard's decision path: decide <em>and</em> enqueue the agent resume in one transaction</td></tr>
+    <tr><td><code>POST /v1/admin/expire-approvals</code></td><td>Run the expiry sweep now</td></tr>
+    <tr><td><code>GET /v1/admin/dashboard/actions|audit|approvals|metrics|dead-letter</code></td><td>The dashboard's five read APIs (full fidelity, filters included)</td></tr>
+  </table>
+</section>
+
+<!-- ================================================================ -->
+<section id="configuration">
+  <h2>Configuration</h2>
+  <p>Everything is environment-driven (<code>.env</code> locally; service env
+  vars in production). <code>.env.example</code> in the repository is the
+  authoritative, commented list.</p>
+
+  <h3>Gateway</h3>
+  <table>
+    <tr><th>Variable</th><th>Meaning</th></tr>
+    <tr><td><code>PAYPAL_CLIENT_ID</code> / <code>PAYPAL_CLIENT_SECRET</code></td><td>PayPal app credentials (required)</td></tr>
+    <tr><td><code>PAYPAL_MODE</code></td><td><code>sandbox</code> or <code>live</code> — selects the base URL; they never share credentials</td></tr>
+    <tr><td><code>DATABASE_URL</code></td><td>Gateway PostgreSQL. Bare <code>postgres://</code>/<code>postgresql://</code> URLs are normalized to the psycopg dialect automatically; Supabase hosts get <code>sslmode=require</code></td></tr>
+    <tr><td><code>REDIS_URL</code></td><td>Rate-limit windows + PayPal token cache (<code>rediss://</code> supported)</td></tr>
+    <tr><td><code>ADMIN_API_KEY</code></td><td>Bootstrap admin credential; unset ⇒ admin routes 503 (fail-safe)</td></tr>
+    <tr><td><code>PAYPAL_WEBHOOK_ID</code></td><td>Production webhook verification (register the endpoint in the PayPal dashboard)</td></tr>
+    <tr><td><code>WEBHOOK_SHARED_SECRET</code></td><td>Dev-only HMAC strategy for the simulator. <b>Leave unset in production</b> — the HMAC path then fails closed</td></tr>
+    <tr><td><code>AGENT_DATABASE_URL</code></td><td>Agent telemetry/checkpoint DB (the dashboard reads reasoning from it)</td></tr>
+    <tr><td><code>RATE_LIMIT_PER_AGENT_PER_MIN</code> / <code>RATE_LIMIT_GLOBAL_PER_MIN</code></td><td>Fixed-window rate limits</td></tr>
+    <tr><td><code>WORKER_IN_PROCESS</code></td><td><code>1</code> embeds the outbox worker as a thread — for hosts without background workers (see <a href="#deployment">Deployment</a>). Default off</td></tr>
+  </table>
+
+  <h3>Agent &amp; worker</h3>
+  <table>
+    <tr><th>Variable</th><th>Meaning</th></tr>
+    <tr><td><code>GEMINI_API_KEY</code> · <code>AGENT_MODEL</code></td><td>LLM credentials and model (default <code>gemini-3.8-flash</code>)</td></tr>
+    <tr><td><code>AGENT_API_KEY</code></td><td>The agent's own <code>tg_…</code> gateway key (issued via the admin API)</td></tr>
+    <tr><td><code>AGENT_MCP_URL</code></td><td>Gateway MCP endpoint (default <code>http://localhost:8000/mcp</code>)</td></tr>
+    <tr><td><code>AGENT_TOKEN_BUDGET</code> · <code>AGENT_MIN_CONFIDENCE</code> · <code>AGENT_PROMPT_VERSION</code></td><td>Budget, confidence floor (default 0.6), prompt set</td></tr>
+    <tr><td><code>WORKER_DATABASE_URL</code></td><td>Queue DB (defaults to <code>DATABASE_URL</code>)</td></tr>
+    <tr><td><code>WORKER_MAX_ATTEMPTS</code> · <code>WORKER_BACKOFF_BASE_SECONDS</code> · <code>WORKER_BACKOFF_MAX_SECONDS</code></td><td>Retry policy (defaults 5 · 2 · 300)</td></tr>
+    <tr><td><code>WORKER_LEASE_SECONDS</code> · <code>WORKER_POLL_INTERVAL_SECONDS</code> · <code>WORKER_BATCH_SIZE</code></td><td>Lease sweep, poll cadence, claim size (defaults 300 · 1 · 5)</td></tr>
+  </table>
+</section>
+
+<!-- ================================================================ -->
+<section id="deployment">
+  <h2>Deployment</h2>
+  <p>The reference deployment runs entirely on free tiers:</p>
+  <table>
+    <tr><th>Piece</th><th>Host</th><th>Notes</th></tr>
+    <tr><td>Gateway (+ MCP, webhooks, dashboard, root card)</td><td>Render free web service</td><td>Single instance; sleeps after ~15 min idle, cold start ~50 s</td></tr>
+    <tr><td>Outbox worker</td><td><b>In-process thread</b> (<code>WORKER_IN_PROCESS=1</code>)</td><td>Render's free plan cannot run background workers — see the honest note below</td></tr>
+    <tr><td>PostgreSQL (gateway + agent data)</td><td>Supabase free</td><td>Session-mode pooler; the agent tables share the <code>postgres</code> database because poolers cannot <code>CREATE DATABASE</code></td></tr>
+    <tr><td>Redis</td><td>Render Key Value (free)</td><td>Rate limits + PayPal token cache</td></tr>
+    <tr><td>These docs</td><td>GitHub Pages</td><td>Static, independent of everything above</td></tr>
+  </table>
+
+  <div class="card warn">
+    <b>The in-process worker is a free-plan accommodation, not the recommended
+    shape.</b> The design intent is a separate <code>python -m worker</code>
+    process (crash isolation, independent scaling, no shared fate with the web
+    tier). Render's free plan forbids background workers, so to stay at $0 the
+    deployment embeds the identical worker stack as a daemon thread inside the
+    web process. Consequences: when the free service sleeps, the worker sleeps
+    with it — queued jobs wait for the next wake-up (webhook deliveries and
+    dashboard traffic wake it; PayPal retries until accepted). Correctness is
+    unaffected — claims use <code>SKIP LOCKED</code>, crashed leases are swept,
+    dispatch is idempotent — only latency degrades. Keep exactly one replica.
+    Moving to a paid worker later is an env-var change, not a code change.
+  </div>
+
+  <h3>Other free-tier caveats, stated plainly</h3>
+  <ul class="tight">
+    <li>Supabase free projects pause after ~1 week of inactivity; wake them from the Supabase dashboard.</li>
+    <li>The Supabase pooler is in Sydney while Render free runs in Oregon — every query crosses the Pacific (~150–180 ms), so multi-round-trip requests take about a second. Fine for a demo; fix later by co-locating regions.</li>
+    <li>Credentials live only in host env vars (Render's <code>sync: false</code> blueprint entries). They are never committed — <code>render.yaml</code> contains no secrets, and a test asserts the repository stays that way.</li>
+  </ul>
+
+  <h3>Production webhook security</h3>
+  <p>Register <code>https://&lt;your-service&gt;.onrender.com/webhooks/paypal</code>
+  in the PayPal developer dashboard and set <code>PAYPAL_WEBHOOK_ID</code> to the
+  id PayPal returns. Leave <code>WEBHOOK_SHARED_SECRET</code> <b>unset</b>: the
+  dev HMAC strategy then fails closed (401), so only PayPal-signed deliveries —
+  verified against PayPal's own API over the exact raw bytes — are ever accepted.</p>
+</section>
+
+<!-- ================================================================ -->
+<footer>
+  <p>Toll Gate — MIT licensed ·
+  <a href="https://github.com/RajNair06/tollgate">source on GitHub</a> ·
+  this page is static and dependency-free; it will outlive every backend.</p>
+</footer>
+
+</main>
+</div>
+</body>
+</html>

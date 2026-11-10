@@ -6,7 +6,7 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from config import get_settings
@@ -19,6 +19,7 @@ from gateway.redis_client import RedisTokenCache
 from gateway.routes import router
 from gateway.dashboard import dashboard_router
 from gateway.webhooks import webhook_router
+from worker.inprocess import start_in_process_worker, worker_requested
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,6 +45,18 @@ async def lifespan(app: FastAPI):
     app.state.paypal = client
     # MCP tools call PayPal through this injected client (shared token cache).
     init_paypal_client(client)
+    # Opt-in embedded outbox worker (WORKER_IN_PROCESS=1) — exists solely
+    # so hosts without background workers (Render's free plan) can still
+    # run the webhook pipeline. Missing credentials log loudly and skip
+    # the thread rather than crashing the web service: the agent key is
+    # provisioned through THIS service's admin API, so a hard failure
+    # would deadlock the first deploy. The separate `python -m worker`
+    # process remains the recommended shape (see README → Deployment).
+    worker_stop = None
+    if worker_requested():
+        started = start_in_process_worker()
+        if started is not None:
+            _, worker_stop = started
     try:
         # The mounted MCP sub-app's lifespan does NOT run automatically under
         # FastAPI — enter it here so the streamable-HTTP session manager is
@@ -51,6 +64,8 @@ async def lifespan(app: FastAPI):
         async with mcp_app.lifespan(app):
             yield
     finally:
+        if worker_stop is not None:
+            worker_stop.set()  # ends the poll loop; the daemon thread exits
         client.close()
         get_engine().dispose()
 
@@ -79,6 +94,73 @@ def health(request: Request) -> dict:
         "paypal_mode": settings.paypal_mode,
         "version": app.version,
     }
+
+
+# Root home card. Registered BEFORE the MCP catch-all mount — the same
+# "route order beats mount order" rule the /dashboard redirect relies on.
+# The project's full documentation lives on GitHub Pages, which does not
+# depend on this process being awake; this page just says "the API is
+# alive" and points at everything.
+DOCS_URL = "https://rajnair06.github.io/tollgate/"
+REPO_URL = "https://github.com/RajNair06/tollgate"
+
+ROOT_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Toll Gate — API</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; min-height: 100vh; display: flex; align-items: center;
+         justify-content: center; background: #0e1117; color: #e6e8ee;
+         font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .card { max-width: 660px; margin: 24px; padding: 32px 36px;
+          background: #151a23; border: 1px solid #2a3140; border-radius: 14px; }
+  h1 { margin: 0 0 4px; font-size: 28px; }
+  .sub { color: #9aa1b1; margin: 0 0 24px; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+         background: #3ddc84; margin-right: 8px; }
+  ul { list-style: none; padding: 0; margin: 0; }
+  li { margin: 10px 0; }
+  a { color: #7ab8ff; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .tag { color: #9aa1b1; font-size: 13px; margin-left: 8px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1><span class="dot"></span>Toll Gate API</h1>
+  <p class="sub">A policy gateway between AI agents and PayPal —
+     version __VERSION__, live.</p>
+  <ul>
+    <li><a href="__DOCS_URL__">Documentation</a>
+        <span class="tag">what it is, how it works, get started — static,
+        always up (GitHub Pages)</span></li>
+    <li><a href="/dashboard/">Admin dashboard</a>
+        <span class="tag">approvals, actions, audit, dead letter (admin key
+        required)</span></li>
+    <li><a href="/docs">OpenAPI reference</a>
+        <span class="tag">interactive API docs served by this app</span></li>
+    <li><a href="/health">Health</a>
+        <span class="tag">liveness probe (JSON)</span></li>
+    <li><a href="__REPO_URL__">Source on GitHub</a>
+        <span class="tag">MIT licensed</span></li>
+  </ul>
+</div>
+</body>
+</html>
+"""
+
+
+@app.get("/", include_in_schema=False)
+def root() -> HTMLResponse:
+    return HTMLResponse(
+        ROOT_PAGE
+        .replace("__VERSION__", app.version)
+        .replace("__DOCS_URL__", DOCS_URL)
+        .replace("__REPO_URL__", REPO_URL)
+    )
 
 
 # Static admin dashboard (increment 9). Mounted BEFORE the MCP catch-all —

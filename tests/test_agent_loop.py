@@ -468,6 +468,25 @@ def test_to_gemini_schema_strips_everything_the_api_rejects():
     assert "source" in cited["items"]["properties"]
 
 
+def test_prompt_v6_bans_merchant_record_claims():
+    """v6 (2026-11-10, live rejected_by_critic under the v4/v5 critic):
+    flash-lite at default temperature re-phrased a packet fact as "we have
+    no record of successful delivery" — a claim about merchant-internal
+    records, which the critic (correctly) rejects. v6's drafter names the
+    trap: missing evidence must be stated packet-relative only. Pairs with
+    lower sampling temperatures in the graph and worker-level resampling
+    of rejected_by_critic runs."""
+    for name in ("draft_response", "critic", "decide_refund", "loop_system"):
+        assert load_prompt(name, "v6")
+    draft = load_prompt("draft_response", "v6")
+    assert "We have no record of" in draft        # banned phrase listed
+    assert "packet ONLY" in draft                  # packet-relative rule
+    assert "We have no record of" not in load_prompt("draft_response", "v5")
+    # v6 keeps the v5 schema placeholder in decide_refund
+    assert "{{DECISION_SCHEMA}}" in load_prompt("decide_refund", "v6")
+    assert "v6" in available_versions()
+
+
 def test_min_confidence_env_parsing(monkeypatch):
     from agent.config import get_agent_settings
     from agent.state import MIN_CONFIDENCE_FOR_ACTION

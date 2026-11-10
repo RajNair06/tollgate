@@ -4,8 +4,10 @@ The classification mirrors the gateway's definite-vs-ambiguous failure
 philosophy (rolling-cap release): a run is only retried when the evidence
 says the failure was TRANSIENT. Definite failures dead-letter immediately
 with the reason recorded; completed verdicts — including verdicts we don't
-like (denied, rejected_by_critic, schema_failed) — are PROCESSED, because
-the pipeline's job was to produce a recorded verdict, and it did.
+like (denied, schema_failed) — are PROCESSED, because the pipeline's job
+was to produce a recorded verdict, and it did. (rejected_by_critic is the
+one exception: the draft is a single LLM sample, so the worker resamples
+it within the attempts budget — every money gate re-runs per sample.)
 
 Every dispatched run's final outcome is written to the gateway's audit_log
 (decision='agent_run_finished') BEFORE the job is finalized, so a retry
@@ -34,7 +36,7 @@ _PROCESSED_STATUSES = frozenset({
     "refund_executed", "refund_executed_after_approval",
     "refund_denied_by_policy", "refund_deduplicated",
     "decision_deny_refund", "decision_escalate_human",
-    "rejected_by_critic", "completed_no_action",
+    "completed_no_action",
     "schema_failed",        # model output broke the schema — terminal by design
     "budget_exceeded",      # retrying with the same budget cannot help
     "pending_approval",     # paused at the interrupt; humans take it from here
@@ -60,6 +62,8 @@ def classify_run(status: str, text: str = "") -> str:
     """'processed' | 'retryable' | 'permanent' for a finished run.
 
     - verdict statuses          -> processed
+    - rejected_by_critic        -> retryable (the draft is one sample;
+                                   resampling re-runs every money gate)
     - llm_error                 -> retryable (provider hiccup AFTER the
                                    client's own backoff ladder gave up)
     - ambiguous failure statuses-> retryable only if the error text carries
@@ -71,6 +75,13 @@ def classify_run(status: str, text: str = "") -> str:
     """
     if status in _PROCESSED_STATUSES:
         return "processed"
+    if status == "rejected_by_critic":
+        # The draft is ONE sample; every money gate (critic, decide, policy,
+        # approvals) re-evaluates on resample, so retrying weakens nothing.
+        # A phrasing flake must not kill a job: live 2026-11-10 flash-lite
+        # re-phrased a packet fact as "we have no record of delivery" and
+        # the critic (correctly) rejected that single sample.
+        return "retryable"
     if status == "llm_error":
         return "retryable"
     if status in _AMBIGUOUS_STATUSES:

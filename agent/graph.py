@@ -62,17 +62,28 @@ _TS_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\b")
 RUNNING = "running"
 
 
+# Sampling temperatures. Judge-like calls (critic, decide) are pinned near
+# deterministic; the drafter keeps a little range for natural prose. At the
+# provider default (~1.0) flash-lite re-phrased packet facts as merchant
+# record claims ("we have no record of delivery") and the critic rejected
+# the run — live validation 2026-11-10.
+_DRAFT_TEMPERATURE = 0.3
+_JUDGE_TEMPERATURE = 0.1
+
+
 def _fail(status: str, error: str) -> dict:
     return {"status": status, "error": error}
 
 
 def _safe_generate(llm: LLMClient, user_text: str, system: str,
-                   response_schema: Any | None = None) -> tuple[str | None, str | None]:
+                   response_schema: Any | None = None,
+                   temperature: float | None = None) -> tuple[str | None, str | None]:
     """One LLM call; returns (text, None) or (None, error). Budget and LLM
     failures become errors the calling node turns into terminal statuses."""
     try:
         result = llm.generate([user_text], system=system,
-                              response_schema=response_schema)
+                              response_schema=response_schema,
+                              temperature=temperature)
         return result.text, None
     except LLMBudgetExceeded as exc:
         return None, f"budget_exceeded: {exc}"
@@ -160,7 +171,8 @@ def build_graph(
             llm,
             f"EVIDENCE PACKET:\n{packet}\n\nDispute: {state['dispute_id']}. "
             f"Produce the draft response and refund recommendation.",
-            prompts["draft_response"])
+            prompts["draft_response"],
+            temperature=_DRAFT_TEMPERATURE)
         if err:
             return _fail(err.split(":")[0], err)
         return {"draft": text}
@@ -183,7 +195,8 @@ def build_graph(
             llm,
             f"EVIDENCE PACKET:\n{evidence_json}\n\nDRAFT:\n{draft}\n\n"
             f"Report violations as JSON.",
-            prompts["critic"])
+            prompts["critic"],
+            temperature=_JUDGE_TEMPERATURE)
         llm_violations: list[dict] = []
         supported = False
         if err:
@@ -212,7 +225,8 @@ def build_graph(
             f"EVIDENCE PACKET:\n{packet}\n\nCRITIC-APPROVED DRAFT:\n{state['draft']}\n\n"
             f"Dispute: {state['dispute_id']}. Reply with the decision JSON.",
             prompts["decide_refund"],
-            response_schema=RefundDecision)
+            response_schema=RefundDecision,
+            temperature=_JUDGE_TEMPERATURE)
         if err:
             return _fail(err.split(":")[0], err)
 

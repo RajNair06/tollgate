@@ -196,12 +196,13 @@ def _agent_run_rows(run_id: str) -> list[tuple]:
     ("refund_deduplicated", "", "processed"),
     ("decision_deny_refund", "", "processed"),
     ("decision_escalate_human", "", "processed"),
-    ("rejected_by_critic", "", "processed"),
     ("completed_no_action", "", "processed"),
     ("schema_failed", "", "processed"),
     ("budget_exceeded", "", "processed"),
     ("pending_approval", "", "processed"),
     ("some_future_status", "", "processed"),  # unknown vocabulary never loops
+    # rejected_by_critic: one draft sample; resampling re-runs every money gate
+    ("rejected_by_critic", "", "retryable"),
     # LLM/provider failures -> retryable
     ("llm_error", "llm_error: 503 model saturated", "retryable"),
     # Ambiguous statuses: the error text decides

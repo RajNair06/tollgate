@@ -96,7 +96,16 @@ class GeminiClient:
             self._client = client
         else:
             from google import genai  # lazy: tests never need the SDK
-            self._client = genai.Client(api_key=api_key)
+            from google.genai import types
+            # The SDK default per-request timeout is 600 s: a provider that
+            # HANGS (instead of 503ing) blocks the single-threaded worker for
+            # up to an hour across the retry ladder — seen live 2026-11-10.
+            # 90 s is ample for these payloads (AFC round-trips included) and
+            # fails fast into the ladder instead.
+            self._client = genai.Client(
+                api_key=api_key,
+                http_options=types.HttpOptions(timeout=90_000),  # milliseconds
+            )
 
     # -- retry policy ---------------------------------------------------------
 

@@ -61,8 +61,10 @@ _HMAC_HEADER = "x-tollgate-signature"
 _HMAC_PREFIX = "sha256="
 
 # Only these event families start an agent run. Everything else is recorded
-# (forensics + replayability) but enqueues nothing.
-_DISPUTE_PREFIX = "CHECKOUT.DISPUTE."
+# (forensics + replayability) but enqueues nothing. CUSTOMER.DISPUTE.* is
+# what PayPal actually delivers (verified against live sandbox traffic);
+# the dashboard's webhook picker lists it under "Customer dispute".
+_DISPUTE_PREFIX = "CUSTOMER.DISPUTE."
 
 
 def _reject(status_code: int, reason_code: str, **extra) -> HTTPException:

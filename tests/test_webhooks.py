@@ -56,7 +56,7 @@ def client():
 
 def _dispute_event(event_id: str | None = None,
                    dispute_id: str = "PP-D-56244",
-                   event_type: str = "CHECKOUT.DISPUTE.CREATED") -> dict:
+                   event_type: str = "CUSTOMER.DISPUTE.CREATED") -> dict:
     """A realistic dispute webhook payload (sandbox resource shape)."""
     return {
         "id": event_id or f"WH-EVT-{uuid4().hex[:12].upper()}",
@@ -148,7 +148,7 @@ def test_hmac_valid_accepted_with_event_and_job(client, monkeypatch):
         row = s.execute(select(WebhookEvent).where(
             WebhookEvent.external_event_id == "WH-EVT-ACCEPTED-1")).scalar_one()
         assert row.verification == "shared_secret"
-        assert row.event_type == "CHECKOUT.DISPUTE.CREATED"
+        assert row.event_type == "CUSTOMER.DISPUTE.CREATED"
         assert row.payload["resource"]["dispute_id"] == "PP-D-56244"
         job = s.execute(select(WebhookOutbox)).scalar_one()
     assert job.job_type == "dispute_agent"
@@ -340,7 +340,7 @@ def test_two_event_ids_same_dispute_enqueue_one_job(client, monkeypatch):
     _enable_hmac(monkeypatch)
     e1 = _dispute_event(event_id="WH-EVT-A", dispute_id="PP-D-77777")
     e2 = _dispute_event(event_id="WH-EVT-B", dispute_id="PP-D-77777",
-                        event_type="CHECKOUT.DISPUTE.UPDATED")
+                        event_type="CUSTOMER.DISPUTE.UPDATED")
     raw1, h1 = _signed(e1)
     raw2, h2 = _signed(e2)
 

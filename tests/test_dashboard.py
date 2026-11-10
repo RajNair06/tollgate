@@ -118,7 +118,7 @@ def _seed_webhook_rows():
         for i in range(2):
             s.add(WebhookEvent(
                 external_event_id=f"WH-DASH-{i}",
-                event_type="CHECKOUT.DISPUTE.CREATED",
+                event_type="CUSTOMER.DISPUTE.CREATED",
                 payload={"i": i}, verification="shared_secret"))
         done = WebhookOutbox(job_type="dispute_agent",
                              dedup_key="dispute:PP-D-DASH1",

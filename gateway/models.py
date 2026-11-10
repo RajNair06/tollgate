@@ -379,7 +379,7 @@ class WebhookEvent(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
     external_event_id: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
-    event_type: Mapped[str] = mapped_column(Text, nullable=False)  # CHECKOUT.DISPUTE.CREATED ...
+    event_type: Mapped[str] = mapped_column(Text, nullable=False)  # CUSTOMER.DISPUTE.CREATED ...
     payload: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
     verification: Mapped[str] = mapped_column(Text, nullable=False)
     received_at: Mapped[datetime] = mapped_column(

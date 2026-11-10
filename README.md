@@ -689,7 +689,7 @@ crashing would deadlock the very first deploy.
 
 1. In the PayPal developer dashboard, register
    `https://<your-service>.onrender.com/webhooks/paypal` for
-   `CHECKOUT.DISPUTE.CREATED` (+ the related dispute events).
+   `CUSTOMER.DISPUTE.CREATED` (+ the other **Customer dispute** events — that is the family PayPal actually delivers).
 2. Set `PAYPAL_WEBHOOK_ID` to the id PayPal returns.
 3. Leave `WEBHOOK_SHARED_SECRET` **unset** — the dev HMAC strategy then
    fails closed (401), so only deliveries verified against PayPal's own

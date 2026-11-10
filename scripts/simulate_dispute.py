@@ -12,7 +12,7 @@ Requires WEBHOOK_SHARED_SECRET in the environment, matching the gateway's.
 Usage:
     uv run python scripts/simulate_dispute.py [--url URL] [--dispute-id ID]
         [--event-id ID] [--capture-id ID] [--amount 10.99] [--currency USD]
-        [--reason REASON] [--event-type CHECKOUT.DISPUTE.CREATED]
+        [--reason REASON] [--event-type CUSTOMER.DISPUTE.CREATED]
 
 Defaults generate a fresh dispute/event id each run. Pass explicit ids to
 replay: the SAME --event-id twice exercises the duplicate-delivery guard;
@@ -58,11 +58,11 @@ def build_payload(
     amount: str = "10.99",
     currency: str = "USD",
     reason: str = "MERCHANDISE_OR_SERVICE_NOT_RECEIVED",
-    event_type: str = "CHECKOUT.DISPUTE.CREATED",
+    event_type: str = "CUSTOMER.DISPUTE.CREATED",
     now: datetime | None = None,
 ) -> dict:
     """A realistic dispute webhook body, shaped like the sandbox's actual
-    CHECKOUT.DISPUTE.CREATED deliveries (resource v2.0)."""
+    CUSTOMER.DISPUTE.CREATED deliveries (resource v2.0)."""
     now = now or datetime.now(timezone.utc)
     created = now - timedelta(minutes=5)
     evidence_due = now + timedelta(days=10)
@@ -132,7 +132,7 @@ def main() -> None:
     parser.add_argument("--amount", default="10.99")
     parser.add_argument("--currency", default="USD")
     parser.add_argument("--reason", default="MERCHANDISE_OR_SERVICE_NOT_RECEIVED")
-    parser.add_argument("--event-type", default="CHECKOUT.DISPUTE.CREATED")
+    parser.add_argument("--event-type", default="CUSTOMER.DISPUTE.CREATED")
     args = parser.parse_args()
 
     secret = os.environ.get("WEBHOOK_SHARED_SECRET", "").strip()

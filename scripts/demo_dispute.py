@@ -3,7 +3,7 @@
 Unlike scripts/simulate_dispute.py — which forges an HMAC dev webhook and
 therefore can never pass production's fail-closed verification — this
 script makes PayPal itself fire a genuinely signed
-CHECKOUT.DISPUTE.CREATED delivery at whatever webhook URL is registered
+CUSTOMER.DISPUTE.CREATED delivery at whatever webhook URL is registered
 on the sandbox app. Production included. That is what makes it the E2E
 demo: real signature verification, real outbox job, real agent run.
 
@@ -111,7 +111,7 @@ def create_dispute(settings, capture_id: str, amount: str,
         print("  body        :", resp.text[:400])
     if resp.status_code >= 300:
         raise SystemExit("Dispute creation failed — see response above.")
-    print("\nPayPal now fires CHECKOUT.DISPUTE.CREATED at every webhook "
+    print("\nPayPal now fires CUSTOMER.DISPUTE.CREATED at every webhook "
           "registered on this app.\nWatch: production logs "
           "('Webhook accepted ... verified via paypal, job=True') and the "
           "dashboard.")

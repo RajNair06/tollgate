@@ -362,6 +362,32 @@ def test_prompt_v2_fixes_refund_intent_wording():
     assert "v2" in available_versions()
 
 
+def test_prompt_v3_mechanical_compliance():
+    """v3 (2026-11-10, second live rejection): v2's stylistic rule ("phrase
+    as intent") was not enough for gemini-3.1-flash-lite — it wrote "We are
+    issuing this refund" anyway, and the v2 critic (told to flag present-
+    tense assertions) rejected it. v3 makes compliance mechanical: the
+    drafter gets allowed/banned phrase lists and an inline MUST for the
+    recommendation sentence; the critic gets an explicit chronology clause
+    (intent — even present progressive — is never a violation) and two new
+    violation classes: completed-refund claims and claimed investigations
+    ("we have reviewed our delivery logs", seen in both live drafts)."""
+    for name in ("draft_response", "critic", "decide_refund", "loop_system"):
+        assert load_prompt(name, "v3")
+    draft = load_prompt("draft_response", "v3")
+    assert 'MUST begin with "We recommend" or "We propose"' in draft
+    assert "Banned phrasings" in draft
+    assert "Never claim investigations" in draft
+    critic = load_prompt("critic", "v3")
+    assert "present-progressive" in critic
+    assert "ALREADY COMPLETED" in critic
+    assert "Claimed investigations" in critic
+    # v1/v2 untouched
+    assert "present-progressive" not in load_prompt("critic", "v2")
+    assert "Banned phrasings" not in load_prompt("draft_response", "v2")
+    assert "v3" in available_versions()
+
+
 def test_min_confidence_env_parsing(monkeypatch):
     from agent.config import get_agent_settings
     from agent.state import MIN_CONFIDENCE_FOR_ACTION

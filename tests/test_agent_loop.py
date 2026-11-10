@@ -388,6 +388,37 @@ def test_prompt_v3_mechanical_compliance():
     assert "v3" in available_versions()
 
 
+def test_prompt_v4_internal_vs_external_jurisdiction():
+    """v4 (2026-11-10, third live rejection): flash-lite complied with the
+    v3 whitelist in the recommendation section but wrote "we have decided
+    to accept the buyer's claim" in the body — and the v3 critic flagged
+    the merchant's own decision as a completed action. Whack-a-mole ends
+    with a principled line: statements of the merchant's decision/intent
+    can never be evidence violations (the draft IS the decision); only
+    external-world claims (money moved, goods delivered, investigations
+    performed) must be evidence-backed. The drafter also gets a
+    placeholder example — small models imitate examples more reliably
+    than rules, and placeholders cannot trip the deterministic ID/
+    timestamp scan."""
+    for name in ("draft_response", "critic", "decide_refund", "loop_system"):
+        assert load_prompt(name, "v4")
+    critic = load_prompt("critic", "v4")
+    assert "JURISDICTION" in critic
+    assert "we have decided to accept the claim" in critic  # named as allowed
+    assert "external world" in critic
+    draft = load_prompt("draft_response", "v4")
+    assert "EXAMPLE" in draft and "<PLACEHOLDER>" in draft
+    assert "We propose to accept the buyer's claim" in draft
+    # placeholders must not match the critic's deterministic scan patterns
+    import re
+    from agent.graph import _ID_RE, _TS_RE
+    assert not _ID_RE.findall(draft)
+    assert not _TS_RE.findall(draft)
+    # v3 untouched
+    assert "JURISDICTION" not in load_prompt("critic", "v3")
+    assert "v4" in available_versions()
+
+
 def test_min_confidence_env_parsing(monkeypatch):
     from agent.config import get_agent_settings
     from agent.state import MIN_CONFIDENCE_FOR_ACTION

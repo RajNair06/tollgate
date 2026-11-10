@@ -24,7 +24,7 @@ services:
         sync: false        # SAME Supabase postgres database (shared — poolers can't CREATE DATABASE)
       - key: REDIS_URL
         fromService:
-          type: kv
+          type: redis
           name: tollgate-kv
           property: connectionString
       - key: ADMIN_API_KEY

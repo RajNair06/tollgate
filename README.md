@@ -700,11 +700,17 @@ crashing would deadlock the very first deploy.
 ### Deploy runbook
 
 ```bash
-render up    # from the repo root: provisions the web service + free KV store
+# From the repo root. CLI v2 has no `render up`; blueprints live under `ea`.
+render ea blueprints create --confirm        # plans the first sync from render.yaml
+render ea blueprints approve <blueprintId>   # applies it: web service + free KV, first deploy
 ```
 
-The first deploy fails until the env vars exist — expected. In the Render
-dashboard → tollgate → Environment set:
+The dashboard equivalent is **New + → Blueprint** (connect the repo).
+`create` writes every `sync: false` var, with an empty value, to
+`~/.render/state/manual-env-vars/<blueprintId>.json` — fill that file
+**before** `approve`, or the first deploy fails on missing config
+(expected). The same vars can be set in the Render dashboard → tollgate →
+Environment:
 
 - `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`, `GEMINI_API_KEY`
 - `DATABASE_URL` **and** `AGENT_DATABASE_URL` — both the *same* Supabase

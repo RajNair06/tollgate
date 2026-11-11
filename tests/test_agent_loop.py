@@ -507,6 +507,28 @@ def test_refund_decision_accepts_real_paypal_dispute_ids():
     assert decision.dispute_id == "PP-R-LUV-10198013"
 
 
+def test_prompt_v7_delegation_rule():
+    """v7 (2026-11-10, live decision_escalate_human on PP-R-UXT-10198070):
+    the decide module escalated a clear item-not-received claim because the
+    dispute was a fresh INQUIRY with an open seller-response window
+    ("premature to issue a refund"). The merchant delegated dispute handling
+    to this system — the run IS the response. v7 forbids treating procedural
+    timing (or downstream-guarded amount size) as reasons to escalate;
+    escalation is for the substance of the claim only."""
+    for name in ("draft_response", "critic", "decide_refund", "loop_system"):
+        assert load_prompt(name, "v7")
+    decide = load_prompt("decide_refund", "v7")
+    assert "delegated dispute handling" in decide
+    assert "procedural timing" in decide
+    assert "{{DECISION_SCHEMA}}" in decide
+    assert "{{MIN_CONFIDENCE}}" in decide
+    assert "delegated" not in load_prompt("decide_refund", "v6")
+    # the other three files are copied from v6 unchanged
+    for name in ("draft_response", "critic", "loop_system"):
+        assert load_prompt(name, "v7") == load_prompt(name, "v6")
+    assert "v7" in available_versions()
+
+
 def test_min_confidence_env_parsing(monkeypatch):
     from agent.config import get_agent_settings
     from agent.state import MIN_CONFIDENCE_FOR_ACTION

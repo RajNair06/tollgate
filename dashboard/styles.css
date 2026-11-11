@@ -42,6 +42,7 @@ body {
   z-index: 10;
 }
 #topbar h1 { margin: 0; font-size: 17px; letter-spacing: .3px; }
+.brand-logo { height: 26px; width: 26px; vertical-align: -7px; margin-right: 9px; }
 #topbar .subtitle { margin-left: 8px; color: var(--muted); font-size: 13px; font-weight: 400; }
 
 #conn { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12.5px; }

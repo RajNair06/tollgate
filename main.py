@@ -6,7 +6,7 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from config import get_settings
@@ -110,6 +110,8 @@ ROOT_PAGE = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Toll Gate — API</title>
+<link rel="icon" href="/favicon.ico" sizes="48x48">
+<link rel="icon" type="image/png" sizes="64x64" href="/dashboard/favicon.png">
 <style>
   :root { color-scheme: dark; }
   body { margin: 0; min-height: 100vh; display: flex; align-items: center;
@@ -130,7 +132,7 @@ ROOT_PAGE = """<!doctype html>
 </head>
 <body>
 <div class="card">
-  <h1><span class="dot"></span>Toll Gate API</h1>
+  <h1><img src="/dashboard/logo.png" alt="" style="height:36px;width:36px;vertical-align:-9px;margin-right:10px"><span class="dot"></span>Toll Gate API</h1>
   <p class="sub">A policy gateway between AI agents and PayPal —
      version __VERSION__, live.</p>
   <ul>
@@ -168,6 +170,13 @@ def root() -> HTMLResponse:
 # /dashboard/; all assets (including vendored AG Grid) are local files, so
 # the page never reaches the network for anything but the JSON APIs.
 DASHBOARD_DIR = Path(__file__).resolve().parent / "dashboard"
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon() -> FileResponse:
+    # Browsers ask for /favicon.ico unconditionally. The icon lives with the
+    # dashboard assets so the repo keeps exactly one copy.
+    return FileResponse(DASHBOARD_DIR / "favicon.ico")
 
 
 @app.get("/dashboard", include_in_schema=False)

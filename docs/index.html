@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Toll Gate — a policy gateway between AI agents and PayPal</title>
+<link rel="icon" href="favicon.ico" sizes="48x48">
+<link rel="icon" type="image/png" sizes="64x64" href="favicon.png">
 <meta name="description" content="Toll Gate: AI agents ask permission to move money. A policy engine decides, caps spending, requires human approval, audits everything, and holds the PayPal credentials so agents never touch money directly.">
 <!--
   This documentation site is deliberately dependency-free:
@@ -53,6 +55,7 @@
   main { flex: 1 1 auto; min-width: 0; padding: 36px 48px 90px; }
   section { margin-bottom: 64px; scroll-margin-top: 20px; }
   h1 { font-size: 34px; line-height: 1.25; margin: 0 0 10px; }
+  .brand-logo { height: 44px; width: 44px; vertical-align: -10px; margin-right: 12px; }
   h2 { font-size: 26px; margin: 0 0 14px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
   h3 { font-size: 19px; margin: 28px 0 8px; }
   p { margin: 10px 0; }
@@ -126,7 +129,7 @@
 
 <!-- ================================================================ -->
 <section id="overview">
-  <h1>Toll Gate</h1>
+  <h1><img src="logo.png" alt="" class="brand-logo">Toll Gate</h1>
   <p class="lede">A policy gateway between AI agents and PayPal. Agents authenticate
   with API keys and <em>ask permission</em> to move money. The gateway decides —
   allow, deny, require human approval, or deduplicate — enforces spending caps

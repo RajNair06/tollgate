@@ -205,8 +205,16 @@ def docs_html():
 def test_docs_have_no_scripts_or_external_assets(docs_html):
     assert "<script" not in docs_html
     assert 'src="http' not in docs_html
-    # No external stylesheets — all CSS is inline (no <link> tags at all):
-    assert "<link" not in docs_html
+    # Every <link> must be a LOCAL icon (favicon.ico / favicon.png); no
+    # stylesheets, no remote icon or font hosts. All CSS is inline.
+    links = re.findall(r"<link[^>]*>", docs_html)
+    assert links, "the favicons are expected to stay linked"
+    for tag in links:
+        assert 'rel="icon"' in tag, f"unexpected <link>: {tag}"
+        assert 'href="http' not in tag, f"remote icon: {tag}"
+    # CSS must not pull anything in either.
+    assert "@import" not in docs_html
+    assert "url(http" not in docs_html
 
 
 @pytest.mark.parametrize("section_id", [

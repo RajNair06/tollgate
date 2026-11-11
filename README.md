@@ -14,6 +14,82 @@ the agent's reasoning, approve or reject its proposed refunds, and watch the
 resumed run execute. The agent and the dashboard are just two more callers —
 real money moves only through the same policy engine.
 
+## Start here
+
+| I want to… | Do this | Time |
+|---|---|---|
+| **See it running** | [Try the hosted demo](#try-the-hosted-demo-no-setup) — nothing to install | 1 min |
+| **Watch the video** | <https://youtu.be/ng67cdFPY18> | 3 min |
+| **Run it locally** | [Requirements](#requirements) → [Run it locally](#run-it-locally) | ~10 min |
+| **Verify the claims** | [Tests](#tests) | ~6 min |
+
+## Try the hosted demo (no setup)
+
+The reference deployment runs on Render's free tier. There is nothing to
+install and no account to create.
+
+| What | URL |
+|---|---|
+| API-alive card | <https://tollgate-jg0z.onrender.com/> |
+| Admin dashboard | <https://tollgate-jg0z.onrender.com/dashboard/> |
+| OpenAPI reference | <https://tollgate-jg0z.onrender.com/docs> |
+| Project docs (GitHub Pages) | <https://rajnair06.github.io/tollgate/> |
+| Demo video | <https://youtu.be/ng67cdFPY18> |
+
+**Admin key for the live dashboard:**
+
+```text
+tga_8882325a31071c8f9437530ff6f5ecc8fd25c4d20828f465
+```
+
+This is a published **sandbox demo key**. It reads every dashboard panel, and
+like any admin key it can also provision agents and approve refunds — against
+the PayPal sandbox, so no real money can move. It is published so judges can
+use the deployment without setup, and it is rotated after the judging period.
+
+> The free tier sleeps after ~15 minutes idle. The first request takes about
+> 50 seconds to wake the service. A slow first load is a cold start, not a
+> failure.
+
+### 60-second tour
+
+1. Open <https://tollgate-jg0z.onrender.com/dashboard/> and paste the key.
+2. Read the top cards: 3 actions, 2 approvals executed, 15 webhook events,
+   3 agent runs, 3 refunds executed.
+3. In **Actions**, find the $25.00 `pending_approval` / `APPROVAL_REQUIRED`
+   row from `webhook-agent` (dispute `PP-R-TSM-10198626`).
+4. In **Audit**, follow the same money: `APPROVED_BY_OPERATOR` →
+   `PAYPAL_REFUND_COMPLETED` → `agent_run_finished:
+   refund_executed_after_approval`. One human click, one sandbox refund, one
+   complete audit trail.
+
+### Mint your own agent key on the live service
+
+The published key is an admin key. To see the agent side, create an agent and
+keep the one-time `tg_` key that comes back:
+
+```bash
+curl -s -X POST https://tollgate-jg0z.onrender.com/v1/admin/agents \
+  -H "X-Admin-Key: tga_8882325a31071c8f9437530ff6f5ecc8fd25c4d20828f465" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"your-agent","allowed_actions":["refund"],
+       "per_txn_cap":"5.00","rolling_24h_cap":"20.00","approval_threshold":"5.00"}'
+# → {"agent_id":3,"api_key":"tg_...","key_id":3,...}   (shown once — save it)
+```
+
+Then ask the gateway for a decision (amounts are decimal **strings**):
+
+```bash
+curl -s -X POST https://tollgate-jg0z.onrender.com/v1/agent-actions \
+  -H "X-API-Key: tg_..." -H 'Content-Type: application/json' \
+  -d '{"action_type":"refund","amount":"1.00","idempotency_key":"try-0001"}'
+# → {"outcome":"pending_approval","reason_code":"APPROVAL_REQUIRED","approval_id":...}
+```
+
+That approval appears in the dashboard you already have open. Approve it there
+and the audit panel grows by one entry. The same agent key also opens the MCP
+server at `/mcp` — the raw-HTTP example is under [API](#api).
+
 ## Architecture
 
 ```mermaid
@@ -481,35 +557,115 @@ uv run python scripts/demo_paused_run.py --approval-id 6 --action-id 70 \
 
 ## Requirements
 
-- Python ≥ 3.12, [uv](https://docs.astral.sh/uv/)
-- Docker (PostgreSQL 16 + Redis 7) — ports 5433/6380 by default, since native
-  services often own 5432/6379 on dev machines
-- PayPal sandbox credentials (developer.paypal.com) for payment execution
-
-## Setup
+Check these first. Each command prints a version, so a missing tool is obvious
+before you install anything.
 
 ```bash
-# infrastructure
+python3 --version    # need 3.12 or newer
+uv --version         # any 0.x — install: https://docs.astral.sh/uv/
+docker --version     # local run only: PostgreSQL 16 + Redis 7 containers
+curl --version       # used by the smoke checks
+openssl version      # used to generate ADMIN_API_KEY
+```
+
+| Path | Needs |
+|---|---|
+| Hosted demo | a browser and `curl` — nothing else |
+| Local run | Python ≥ 3.12, `uv`, Docker, PayPal sandbox credentials, `GEMINI_API_KEY` |
+| Tests | Python ≥ 3.12, `uv`, the Docker containers from the local run |
+
+If you already run PostgreSQL 16+ and Redis 7+, skip Docker and point
+`DATABASE_URL` and `REDIS_URL` in `.env` at them. PayPal credentials are
+required at startup: `config.py` refuses to load without
+`PAYPAL_CLIENT_ID` and `PAYPAL_CLIENT_SECRET`.
+
+## Run it locally
+
+Seven steps, in order. Every block is copy-paste and holds one command per
+line.
+
+### 1 · Start PostgreSQL and Redis in Docker
+
+```bash
 docker run -d --name tollgate-pg -e POSTGRES_USER=tollgate -e POSTGRES_PASSWORD=tollgate \
   -e POSTGRES_DB=tollgate -p 5433:5432 postgres:16-alpine
 docker run -d --name tollgate-redis -p 6380:6379 redis:7-alpine
-
-# app
-uv sync
-cp .env.example .env    # fill PayPal creds; generate ADMIN_API_KEY:  tga_$(openssl rand -hex 24)
-uv run alembic upgrade head
-uv run uvicorn main:app --port 8000   # gateway: REST + MCP + webhook + dashboard
-uv run python -m worker               # outbox worker (separate process)
 ```
+
+Ports 5433 and 6380 instead of the defaults, because native PostgreSQL and
+Redis services often own 5432 and 6379 on a dev machine.
+
+### 2 · Get the code and the Python dependencies
+
+```bash
+git clone https://github.com/RajNair06/tollgate.git
+cd tollgate
+uv sync
+```
+
+### 3 · Get the credentials
+
+| Value | Where to get it | Needed for |
+|---|---|---|
+| `PAYPAL_CLIENT_ID` + `PAYPAL_CLIENT_SECRET` | developer.paypal.com → Apps & Credentials → Sandbox | creating orders, refunds, and disputes |
+| `GEMINI_API_KEY` | aistudio.google.com | the dispute agent's draft and critic steps |
+
+### 4 · Create the .env file
+
+```bash
+cp .env.example .env
+```
+
+Open `.env` and fill the three values from step 3. Generate the admin key with
+its own command, then paste the result after `ADMIN_API_KEY=`:
+
+```bash
+openssl rand -hex 24    # prefix the output with tga_
+```
+
+`.env.example` documents every optional setting, with defaults.
+
+### 5 · Create the database schema
+
+```bash
+uv run alembic upgrade head
+```
+
+### 6 · Start the gateway, then the worker
+
+Terminal 2 — the gateway serves REST + MCP + webhooks + the dashboard on port
+8000:
+
+```bash
+uv run uvicorn main:app --port 8000
+```
+
+Terminal 3 — the outbox worker is a separate process and holds no PayPal
+credentials:
+
+```bash
+uv run python -m worker
+```
+
+### 7 · Check that it works
+
+```bash
+curl -s localhost:8000/health
+# → {"status":"ok","paypal_mode":"sandbox",...}
+```
+
+Then open <http://localhost:8000/dashboard/> and paste your `ADMIN_API_KEY`.
 
 The agent's own database (checkpoints + `agent_runs`) is created and
 migrated automatically on first use (`agent/checkpoint.py` connects to the
 server, `CREATE DATABASE`s the target, and runs the LangGraph saver setup).
 
-## Usage
+## First requests (in order)
 
-Provision an agent (via API, or the CLI equivalent
-`uv run python scripts/create_agent.py <name> [per_txn] [rolling_24h] [threshold] [ttl_min] [actions...]`):
+The calls below follow the real sequence: provision an agent, keep its key,
+ask for a decision, then decide the approval.
+
+### 1 · Provision an agent (admin key)
 
 ```bash
 curl -s -X POST localhost:8000/v1/admin/agents \
@@ -519,7 +675,15 @@ curl -s -X POST localhost:8000/v1/admin/agents \
 # → {"agent_id":1,"api_key":"tg_...","key_id":1,"key_prefix":"tg_..."}   (key shown once)
 ```
 
-Request a decision:
+The same provisioning is available as a CLI:
+`uv run python scripts/create_agent.py <name> [per_txn] [rolling_24h] [threshold] [ttl_min] [actions...]`
+
+### 2 · Keep the one-time key
+
+The plaintext `tg_...` key exists only in that response. Save it as
+`AGENT_API_KEY` in `.env` if the dispute agent and worker should use it.
+
+### 3 · Request a decision (agent key)
 
 ```bash
 curl -s -X POST localhost:8000/v1/agent-actions \
@@ -529,7 +693,7 @@ curl -s -X POST localhost:8000/v1/agent-actions \
 # replaying the same idempotency_key → {"outcome":"deduplicated","original_outcome":...}
 ```
 
-Decide and execute the approval:
+### 4 · Decide and execute the approval (agent key)
 
 ```bash
 curl -s -X POST localhost:8000/v1/approvals/1/decision \
@@ -540,26 +704,29 @@ curl -s -X POST localhost:8000/v1/approvals/1/execute \
   -d '{"executed":true}'
 ```
 
-PayPal end-to-end sandbox flow (create order → approve in browser → capture →
-partial refund → idempotent replay; refuses to run outside sandbox):
+### 5 · Run the PayPal sandbox flow end to end
+
+Create order → approve in the browser → capture → partial refund → idempotent
+replay. The script refuses to run outside sandbox:
 
 ```bash
 uv run python scripts/toll_flow.py
 ```
 
-Webhook pipeline + dashboard (full flow in the demo runbook above):
+### 6 · Fire a signed webhook at the real endpoint
 
 ```bash
-uv run python -m worker    # terminal 2: consumes webhook_outbox jobs
-
-# terminal 3: fire a signed test webhook at the real endpoint
 WEBHOOK_SHARED_SECRET=dev-shared-secret uv run python scripts/simulate_dispute.py
-
-# browser: http://localhost:8000/dashboard/  (prompts for ADMIN_API_KEY)
 ```
 
-Call a tool over MCP with raw HTTP (streamable HTTP is plain JSON-RPC;
-`initialize` returns an `mcp-session-id` header to reuse):
+The same secret must be set on the gateway, or the delivery fails closed with
+401. The dispatched run fails with a real `RESOURCE_NOT_FOUND` (the simulated
+dispute does not exist in the sandbox) and lands in the dead-letter panel.
+
+### 7 · Call a tool over MCP
+
+Streamable HTTP is plain JSON-RPC; `initialize` returns an `mcp-session-id`
+header to reuse:
 
 ```bash
 curl -si -X POST localhost:8000/mcp \
@@ -636,15 +803,27 @@ in-process worker on, every secret `sync: false`, plus a byte-scan
 proving no git-trackable file contains the production database
 password.
 
+## Sponsor tools
 
+Two sponsor tools are used, and both are checkable in this repository:
 
+| Tool | Where | What it does here |
+|---|---|---|
+| **AG Grid** (Community 31.3.4) | `dashboard/vendor/`, pinned by `tests/test_dashboard_static.py` | drives the approvals, actions, audit, and dead-letter grids. Vendored with fonts as data URIs, so the dashboard runs with no network at all |
+| **Render** | `render.yaml`, live at <https://tollgate-jg0z.onrender.com/> | hosts the gateway, MCP server, webhook front door, dashboard, and the in-process worker; Render Key Value backs the rate-limit windows and the PayPal token cache |
+
+No other tool from the sponsor list is used: there is no Postman collection,
+no APIMatic SDK, and no Channel3, Bryntum, Zapier, Elastic, KERNEL, or
+Astropods integration in this codebase.
 
 ## Deployment (Render + Supabase + GitHub Pages — all free tier)
 
-The reference deployment runs at $0/month. `render.yaml` at the repo root
-is the blueprint (`render up` provisions it); every secret is a
-`sync: false` entry set in the Render dashboard — nothing sensitive ever
-enters git, and `tests/test_deploy.py` enforces that.
+This submission's deployment runs at <https://tollgate-jg0z.onrender.com/>
+(dashboard at `/dashboard/`). The rest of this section documents how to
+reproduce it from scratch. `render.yaml` at the repo root is the blueprint
+(`render up` provisions it); every secret is a `sync: false` entry set in the
+Render dashboard — nothing sensitive ever enters git, and
+`tests/test_deploy.py` enforces that.
 
 | Piece | Host | Notes |
 |---|---|---|
